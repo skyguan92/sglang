@@ -105,7 +105,7 @@ jobs:
         id: wait
         with:
           stage-name: stage-a
-          jobs: '["multimodal-gen-unit-test"]'
+          jobs: '[{"prefix":"call-multimodal-gen-tests / multimodal-gen-unit-test","expected_count":1}]'
           max-wait-minutes: '180'
 
   multimodal-gen-test-1-gpu:
