@@ -1,5 +1,7 @@
+import json
 import logging
 import math
+import os
 from copy import deepcopy
 from typing import Optional, Union
 
@@ -29,7 +31,7 @@ from sglang.srt.speculative.dflash_utils import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import get_bool_env_var, is_cuda
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +85,13 @@ class DFlashWorker:
 
         self._warned_sampling_fallback = False
         self._logged_first_verify = False
+        self._disable_fused_kv_materialize = get_bool_env_var(
+            "UNIFYINFER_DFLASH_DISABLE_FUSED_KV_MATERIALIZE"
+        )
+        self._trace_live_layer0_kv_json = os.getenv(
+            "UNIFYINFER_DFLASH_TRACE_LIVE_LAYER0_KV_JSON"
+        )
+        self._trace_live_layer0_kv_emitted = False
 
         # Draft runner (separate KV cache + attention backend).
         # Without draft windowing, the draft worker aliases the target request->token
@@ -99,26 +108,29 @@ class DFlashWorker:
         draft_server_args = deepcopy(server_args)
         draft_server_args.skip_tokenizer_init = True
         draft_backend = draft_server_args.speculative_draft_attention_backend
-        supported_draft_backends = ("flashinfer", "fa3", "fa4")
+        supported_draft_backends = ("flashinfer", "fa3", "fa4", "triton")
+        default_draft_backend = "flashinfer" if is_cuda() else "triton"
         if draft_backend is None:
             draft_backend, _ = draft_server_args.get_attention_backends()
         if draft_backend is None:
-            draft_backend = "flashinfer"
+            draft_backend = default_draft_backend
         elif draft_backend == "trtllm_mha":
             logger.warning(
                 "DFLASH draft worker does not support 'trtllm_mha' because the "
                 "draft path requires non-causal attention. Falling back to "
-                "'flashinfer'."
+                "%r.",
+                default_draft_backend,
             )
-            draft_backend = "flashinfer"
+            draft_backend = default_draft_backend
         elif draft_backend not in supported_draft_backends:
             logger.warning(
                 "DFLASH draft worker only supports attention_backend in %s for now, "
-                "but got %r. Falling back to 'flashinfer'.",
+                "but got %r. Falling back to %r.",
                 supported_draft_backends,
                 draft_backend,
+                default_draft_backend,
             )
-            draft_backend = "flashinfer"
+            draft_backend = default_draft_backend
         # Make the draft worker backend explicit and self-contained (no further overrides).
         draft_server_args.speculative_draft_attention_backend = None
         draft_server_args.prefill_attention_backend = None
@@ -216,8 +228,15 @@ class DFlashWorker:
         self._draft_greedy_selected_ids_buf: Optional[torch.Tensor] = None
         self._draft_greedy_index_cap: int = 0
 
-        self._use_fused_kv_materialize = is_cuda()
+        self._use_fused_kv_materialize = (
+            is_cuda() and not self._disable_fused_kv_materialize
+        )
         self._fused_kv_helper: Optional[object] = None
+        if self._disable_fused_kv_materialize and self.tp_rank == 0:
+            logger.info(
+                "DFLASH fused KV materialization disabled by env "
+                "UNIFYINFER_DFLASH_DISABLE_FUSED_KV_MATERIALIZE=1"
+            )
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
 
@@ -1007,10 +1026,17 @@ class DFlashWorker:
         ctx_positions: torch.Tensor,
         ctx_cache_loc: torch.Tensor,
     ) -> None:
-        for layer in self.draft_model.layers:
+        for layer_idx, layer in enumerate(self.draft_model.layers):
             attn = layer.self_attn
             k, v = attn.kv_proj_only(ctx_hidden)
             k = attn.apply_k_norm(k)
+            self._maybe_trace_live_layer0_kv(
+                layer_idx=layer_idx,
+                ctx_hidden=ctx_hidden,
+                ctx_positions=ctx_positions,
+                k=k,
+                v=v,
+            )
             k = attn.apply_k_rope(ctx_positions, k)
             k = k.view(-1, attn.num_kv_heads, attn.head_dim)
             v = v.view(-1, attn.num_kv_heads, attn.head_dim)
@@ -1022,6 +1048,58 @@ class DFlashWorker:
                 attn.attn.k_scale,
                 attn.attn.v_scale,
             )
+
+    def _maybe_trace_live_layer0_kv(
+        self,
+        *,
+        layer_idx: int,
+        ctx_hidden: torch.Tensor,
+        ctx_positions: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> None:
+        if (
+            self._trace_live_layer0_kv_emitted
+            or self._trace_live_layer0_kv_json is None
+            or self.tp_rank != 0
+            or layer_idx != 0
+        ):
+            return
+
+        self._trace_live_layer0_kv_emitted = True
+        try:
+            k_fp32 = k.float()
+            v_fp32 = v.float()
+            k_sum = float(k_fp32.sum().item())
+            v_sum = float(v_fp32.sum().item())
+            payload = {
+                "mode": "dflash_live_layer0_kvproj_knorm",
+                "layer_idx": int(layer_idx),
+                "tp_rank": int(self.tp_rank),
+                "ctx_hidden_shape": [int(x) for x in ctx_hidden.shape],
+                "ctx_positions_shape": [int(x) for x in ctx_positions.shape],
+                "ctx_positions_min": (
+                    int(ctx_positions.min().item()) if ctx_positions.numel() > 0 else None
+                ),
+                "ctx_positions_max": (
+                    int(ctx_positions.max().item()) if ctx_positions.numel() > 0 else None
+                ),
+                "k_shape": [int(x) for x in k.shape],
+                "v_shape": [int(x) for x in v.shape],
+                "k_finite": int(torch.isfinite(k).sum().item()),
+                "k_nan": int(torch.isnan(k).sum().item()),
+                "k_inf": int(torch.isinf(k).sum().item()),
+                "v_finite": int(torch.isfinite(v).sum().item()),
+                "v_nan": int(torch.isnan(v).sum().item()),
+                "v_inf": int(torch.isinf(v).sum().item()),
+                "k_sum": k_sum,
+                "v_sum": v_sum,
+                "kv_sum": float(k_sum + v_sum),
+            }
+            with open(self._trace_live_layer0_kv_json, "a", encoding="utf-8") as fout:
+                fout.write(json.dumps(payload, sort_keys=True) + "\n")
+        except Exception as e:
+            logger.warning("DFLASH live layer0 KV trace failed: %s", e)
 
     def _append_target_hidden_fused(
         self,
