@@ -204,9 +204,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(0)})
         set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
 
-        conv_weights = self.conv1d.weight.view(
-            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
-        )
         self.attn = RadixLinearAttention(
             layer_id=layer_id,
             num_q_heads=self.num_k_heads // self.attn_tp_size,
@@ -215,7 +212,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             head_q_dim=self.head_k_dim,
             head_k_dim=self.head_k_dim,
             head_v_dim=self.head_v_dim,
-            conv_weights=conv_weights,
+            conv_weights=self._get_runtime_conv_weights(),
             bias=self.conv1d.bias,
             activation=self.activation,
             A_log=self.A_log,
@@ -428,6 +425,24 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             projected_states_ba, _ = self.in_proj_ba(hidden_states)
         return projected_states_qkvz, projected_states_ba
 
+    def _get_runtime_conv_weights(self) -> torch.Tensor:
+        return self.conv1d.weight.view(
+            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+        )
+
+    def _refresh_attn_conv_weights(self) -> None:
+        # RadixLinearAttention stores conv_weights as a tensor attribute, so
+        # rebuild the view from the live parameter in case weight loading
+        # replaced the underlying conv1d storage after module construction.
+        conv_weights = self._get_runtime_conv_weights()
+        attn_conv_weights = getattr(self.attn, "conv_weights", None)
+        if (
+            attn_conv_weights is not None
+            and conv_weights.device != attn_conv_weights.device
+        ):
+            conv_weights = conv_weights.to(device=attn_conv_weights.device)
+        self.attn.conv_weights = conv_weights
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -442,6 +457,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         projected_states_qkvz, projected_states_ba = self._forward_input_proj(
             hidden_states
         )
+        self._refresh_attn_conv_weights()
 
         if self.num_v_heads // self.num_k_heads in [1, 2, 4] and not _is_cpu:
             mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
