@@ -91,7 +91,27 @@ class DFlashWorker:
         self._trace_live_layer0_kv_json = os.getenv(
             "UNIFYINFER_DFLASH_TRACE_LIVE_LAYER0_KV_JSON"
         )
+        trace_live_layer0_kv_tokens = os.getenv(
+            "UNIFYINFER_DFLASH_TRACE_LIVE_LAYER0_KV_TOKENS"
+        )
+        self._trace_live_layer0_kv_tokens = (
+            int(trace_live_layer0_kv_tokens)
+            if trace_live_layer0_kv_tokens is not None
+            else None
+        )
         self._trace_live_layer0_kv_emitted = False
+        self._trace_live_draft_kv_json = os.getenv(
+            "UNIFYINFER_DFLASH_TRACE_LIVE_DRAFT_KV_JSON"
+        )
+        trace_live_draft_kv_tokens = os.getenv(
+            "UNIFYINFER_DFLASH_TRACE_LIVE_DRAFT_KV_TOKENS"
+        )
+        self._trace_live_draft_kv_tokens = (
+            int(trace_live_draft_kv_tokens)
+            if trace_live_draft_kv_tokens is not None
+            else None
+        )
+        self._trace_live_draft_kv_emitted = False
 
         # Draft runner (separate KV cache + attention backend).
         # Without draft windowing, the draft worker aliases the target request->token
@@ -1026,6 +1046,15 @@ class DFlashWorker:
         ctx_positions: torch.Tensor,
         ctx_cache_loc: torch.Tensor,
     ) -> None:
+        layer_observed_scalars = (
+            []
+            if (
+                self._trace_live_draft_kv_json is not None
+                and not self._trace_live_draft_kv_emitted
+                and self.tp_rank == 0
+            )
+            else None
+        )
         for layer_idx, layer in enumerate(self.draft_model.layers):
             attn = layer.self_attn
             k, v = attn.kv_proj_only(ctx_hidden)
@@ -1038,6 +1067,10 @@ class DFlashWorker:
                 v=v,
             )
             k = attn.apply_k_rope(ctx_positions, k)
+            if layer_observed_scalars is not None:
+                layer_observed_scalars.append(
+                    float((k.float().sum() + v.float().sum()).item())
+                )
             k = k.view(-1, attn.num_kv_heads, attn.head_dim)
             v = v.view(-1, attn.num_kv_heads, attn.head_dim)
             self.draft_model_runner.token_to_kv_pool.set_kv_buffer(
@@ -1048,6 +1081,11 @@ class DFlashWorker:
                 attn.attn.k_scale,
                 attn.attn.v_scale,
             )
+        self._maybe_trace_live_draft_kv(
+            ctx_hidden=ctx_hidden,
+            ctx_positions=ctx_positions,
+            layer_observed_scalars=layer_observed_scalars,
+        )
 
     def _maybe_trace_live_layer0_kv(
         self,
@@ -1063,6 +1101,10 @@ class DFlashWorker:
             or self._trace_live_layer0_kv_json is None
             or self.tp_rank != 0
             or layer_idx != 0
+            or (
+                self._trace_live_layer0_kv_tokens is not None
+                and int(ctx_hidden.shape[0]) != self._trace_live_layer0_kv_tokens
+            )
         ):
             return
 
@@ -1100,6 +1142,51 @@ class DFlashWorker:
                 fout.write(json.dumps(payload, sort_keys=True) + "\n")
         except Exception as e:
             logger.warning("DFLASH live layer0 KV trace failed: %s", e)
+
+    def _maybe_trace_live_draft_kv(
+        self,
+        *,
+        ctx_hidden: torch.Tensor,
+        ctx_positions: torch.Tensor,
+        layer_observed_scalars,
+    ) -> None:
+        if (
+            self._trace_live_draft_kv_emitted
+            or self._trace_live_draft_kv_json is None
+            or self.tp_rank != 0
+            or layer_observed_scalars is None
+            or (
+                self._trace_live_draft_kv_tokens is not None
+                and int(ctx_hidden.shape[0]) != self._trace_live_draft_kv_tokens
+            )
+        ):
+            return
+
+        self._trace_live_draft_kv_emitted = True
+        try:
+            payload = {
+                "mode": "dflash_live_draft_kv_materialize",
+                "tp_rank": int(self.tp_rank),
+                "ctx_hidden_shape": [int(x) for x in ctx_hidden.shape],
+                "ctx_hidden_finite": int(torch.isfinite(ctx_hidden).sum().item()),
+                "ctx_hidden_nan": int(torch.isnan(ctx_hidden).sum().item()),
+                "ctx_hidden_inf": int(torch.isinf(ctx_hidden).sum().item()),
+                "ctx_hidden_sum": float(ctx_hidden.float().sum().item()),
+                "ctx_positions_shape": [int(x) for x in ctx_positions.shape],
+                "ctx_positions_min": (
+                    int(ctx_positions.min().item()) if ctx_positions.numel() > 0 else None
+                ),
+                "ctx_positions_max": (
+                    int(ctx_positions.max().item()) if ctx_positions.numel() > 0 else None
+                ),
+                "num_draft_layers": len(layer_observed_scalars),
+                "layer_observed_scalars": layer_observed_scalars,
+                "total_observed_scalar": float(sum(layer_observed_scalars)),
+            }
+            with open(self._trace_live_draft_kv_json, "a", encoding="utf-8") as fout:
+                fout.write(json.dumps(payload, sort_keys=True) + "\n")
+        except Exception as e:
+            logger.warning("DFLASH live draft KV trace failed: %s", e)
 
     def _append_target_hidden_fused(
         self,
