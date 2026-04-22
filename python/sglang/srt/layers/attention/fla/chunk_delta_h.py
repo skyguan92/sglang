@@ -30,6 +30,9 @@ _use_unifyinfer_qwen35_fla_chunk_delta_h_bv64_alt = get_bool_env_var(
 _use_unifyinfer_qwen35_fla_chunk_delta_h_warps2_alt = get_bool_env_var(
     "UNIFYINFER_QWEN35_FLA_CHUNK_DELTA_H_WARPS2_ALT"
 )
+_use_unifyinfer_qwen35_fla_chunk_delta_h_warps8_alt = get_bool_env_var(
+    "UNIFYINFER_QWEN35_FLA_CHUNK_DELTA_H_WARPS8_ALT"
+)
 
 
 # @triton.autotune(
@@ -328,7 +331,9 @@ def chunk_gated_delta_rule_fwd_h(
         cfg = {
             "BV": 64 if _use_unifyinfer_qwen35_fla_chunk_delta_h_bv64_alt else 32,
             "num_warps": (
-                2 if _use_unifyinfer_qwen35_fla_chunk_delta_h_warps2_alt else 4
+                2
+                if _use_unifyinfer_qwen35_fla_chunk_delta_h_warps2_alt
+                else 8 if _use_unifyinfer_qwen35_fla_chunk_delta_h_warps8_alt else 4
             ),
             "num_stages": 2,
         }
