@@ -21,6 +21,9 @@ CHUNK_SIZE = 64
 _use_unifyinfer_qwen35_fla_dispatch_alt = get_bool_env_var(
     "UNIFYINFER_QWEN35_FLA_DISPATCH_ALT"
 )
+_use_unifyinfer_qwen35_fla_chunk_delta_h_alt = get_bool_env_var(
+    "UNIFYINFER_QWEN35_FLA_CHUNK_DELTA_H_ALT"
+)
 
 
 # @triton.autotune(
@@ -309,7 +312,10 @@ def chunk_gated_delta_rule_fwd_h(
     h = k.new_empty(B, NT, H, V, K)
 
     v_new = torch.empty_like(u) if save_new_value else None
-    if _use_unifyinfer_qwen35_fla_dispatch_alt:
+    if (
+        _use_unifyinfer_qwen35_fla_dispatch_alt
+        or _use_unifyinfer_qwen35_fla_chunk_delta_h_alt
+    ):
         # Bounded ROCm probe taken from the dormant autotune search space.
         cfg = {"BV": 64, "num_warps": 2, "num_stages": 2}
     else:
