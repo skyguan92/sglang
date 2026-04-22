@@ -24,6 +24,12 @@ _use_unifyinfer_qwen35_fla_dispatch_alt = get_bool_env_var(
 _use_unifyinfer_qwen35_fla_chunk_delta_h_alt = get_bool_env_var(
     "UNIFYINFER_QWEN35_FLA_CHUNK_DELTA_H_ALT"
 )
+_use_unifyinfer_qwen35_fla_chunk_delta_h_bv64_alt = get_bool_env_var(
+    "UNIFYINFER_QWEN35_FLA_CHUNK_DELTA_H_BV64_ALT"
+)
+_use_unifyinfer_qwen35_fla_chunk_delta_h_warps2_alt = get_bool_env_var(
+    "UNIFYINFER_QWEN35_FLA_CHUNK_DELTA_H_WARPS2_ALT"
+)
 
 
 # @triton.autotune(
@@ -319,7 +325,13 @@ def chunk_gated_delta_rule_fwd_h(
         # Bounded ROCm probe taken from the dormant autotune search space.
         cfg = {"BV": 64, "num_warps": 2, "num_stages": 2}
     else:
-        cfg = {"BV": 32, "num_warps": 4, "num_stages": 2}
+        cfg = {
+            "BV": 64 if _use_unifyinfer_qwen35_fla_chunk_delta_h_bv64_alt else 32,
+            "num_warps": (
+                2 if _use_unifyinfer_qwen35_fla_chunk_delta_h_warps2_alt else 4
+            ),
+            "num_stages": 2,
+        }
 
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), N * H)
