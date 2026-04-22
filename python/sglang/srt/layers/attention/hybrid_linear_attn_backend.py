@@ -620,7 +620,7 @@ class MambaAttnBackendBase(AttentionBackend):
         Note: Conv state tracking for extend is handled separately via gather operations
         using indices computed by `_init_track_conv_indices`.
         """
-        if forward_metadata.has_mamba_track_mask:
+        if getattr(forward_metadata, "has_mamba_track_mask", False):
             h = h.squeeze(0)
 
             if forward_metadata.track_ssm_h_src.numel() > 0:

@@ -14,9 +14,13 @@ from sglang.srt.layers.attention.fla.index import (
 )
 from sglang.srt.layers.attention.fla.op import exp, safe_exp
 from sglang.srt.layers.attention.fla.utils import is_nvidia_hopper
+from sglang.srt.utils import get_bool_env_var
 
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
 CHUNK_SIZE = 64
+_use_unifyinfer_qwen35_fla_dispatch_alt = get_bool_env_var(
+    "UNIFYINFER_QWEN35_FLA_DISPATCH_ALT"
+)
 
 
 # @triton.autotune(
@@ -305,6 +309,11 @@ def chunk_gated_delta_rule_fwd_h(
     h = k.new_empty(B, NT, H, V, K)
 
     v_new = torch.empty_like(u) if save_new_value else None
+    if _use_unifyinfer_qwen35_fla_dispatch_alt:
+        # Bounded ROCm probe taken from the dormant autotune search space.
+        cfg = {"BV": 64, "num_warps": 2, "num_stages": 2}
+    else:
+        cfg = {"BV": 32, "num_warps": 4, "num_stages": 2}
 
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), N * H)
@@ -327,14 +336,14 @@ def chunk_gated_delta_rule_fwd_h(
         K=K,
         V=V,
         BT=BT,
-        BV=32,
+        BV=cfg["BV"],
         USE_G=g is not None,
         USE_GK=gk is not None,
         USE_INITIAL_STATE=initial_state is not None,
         INPLACE_UPDATE=True,
         SAVE_NEW_VALUE=v_new is not None,
         IS_VARLEN=cu_seqlens is not None,
-        num_warps=4,
-        num_stages=2,
+        num_warps=cfg["num_warps"],
+        num_stages=cfg["num_stages"],
     )
     return h, v_new
