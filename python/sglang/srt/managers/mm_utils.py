@@ -7,12 +7,14 @@ import hashlib
 import pickle
 from abc import abstractmethod
 from collections import defaultdict
+from contextlib import nullcontext
 from multiprocessing import shared_memory
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 import torch
 from torch import nn
+from torch.autograd.profiler import record_function
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.multimodal import gpu_tensor_hash
@@ -26,10 +28,18 @@ from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalSta
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import flatten_nested_list, is_npu, print_warning_once
+from sglang.srt.utils import (
+    flatten_nested_list,
+    get_bool_env_var,
+    is_npu,
+    print_warning_once,
+)
 from sglang.utils import logger
 
 _is_npu = is_npu()
+_use_unifyinfer_qwen35_trace_mm_split = get_bool_env_var(
+    "UNIFYINFER_QWEN35_TRACE_MM_SPLIT"
+)
 
 # NOTE: Using the shared logger from sglang.utils instead of creating a module-specific logger
 # to ensure consistent logging behavior across the codebase. This prevents issues with log
@@ -45,6 +55,12 @@ _GPU_FEATURE_BUFFER: Optional[torch.Tensor] = None
 _BUFFER_OFFSET = 0
 
 _is_default_tensor_transport = None
+
+
+def _qwen35_mm_trace_span(name: str):
+    if not _use_unifyinfer_qwen35_trace_mm_split:
+        return nullcontext()
+    return record_function(name)
 
 
 def init_feature_buffer(device):
@@ -1036,30 +1052,32 @@ def general_mm_embed_routine(
             server_args = get_global_server_args()
             if server_args and server_args.enable_adaptive_dispatch_to_encoder:
                 # Split by precomputed vs non-precomputed so get_embedding_and_mask only sees uniform batches
-                input_embeds, other_info = _embed_mm_inputs_with_split(
-                    mm_inputs_list=mm_inputs_list,
-                    extend_prefix_lens=extend_prefix_lens,
-                    extend_seq_lens=extend_seq_lens,
-                    input_ids=input_ids,
-                    forward_batch=forward_batch,
-                    input_embedding=embed_tokens,
-                    multimodal_model=multimodal_model,
-                    data_embedding_func_mapping=data_embedding_funcs,
-                    placeholder_tokens=placeholder_tokens,
-                    use_deepstack=use_deepstack,
-                )
+                with _qwen35_mm_trace_span("_qwen35_mmsplit_mm_embed_inputs"):
+                    input_embeds, other_info = _embed_mm_inputs_with_split(
+                        mm_inputs_list=mm_inputs_list,
+                        extend_prefix_lens=extend_prefix_lens,
+                        extend_seq_lens=extend_seq_lens,
+                        input_ids=input_ids,
+                        forward_batch=forward_batch,
+                        input_embedding=embed_tokens,
+                        multimodal_model=multimodal_model,
+                        data_embedding_func_mapping=data_embedding_funcs,
+                        placeholder_tokens=placeholder_tokens,
+                        use_deepstack=use_deepstack,
+                    )
             else:
-                input_embeds, other_info = embed_mm_inputs(
-                    mm_inputs_list=mm_inputs_list,
-                    extend_prefix_lens=extend_prefix_lens,
-                    extend_seq_lens=extend_seq_lens,
-                    input_ids=input_ids,
-                    input_embedding=embed_tokens,
-                    multimodal_model=multimodal_model,
-                    data_embedding_func_mapping=data_embedding_funcs,
-                    placeholder_tokens=placeholder_tokens,
-                    use_deepstack=use_deepstack,
-                )
+                with _qwen35_mm_trace_span("_qwen35_mmsplit_mm_embed_inputs"):
+                    input_embeds, other_info = embed_mm_inputs(
+                        mm_inputs_list=mm_inputs_list,
+                        extend_prefix_lens=extend_prefix_lens,
+                        extend_seq_lens=extend_seq_lens,
+                        input_ids=input_ids,
+                        input_embedding=embed_tokens,
+                        multimodal_model=multimodal_model,
+                        data_embedding_func_mapping=data_embedding_funcs,
+                        placeholder_tokens=placeholder_tokens,
+                        use_deepstack=use_deepstack,
+                    )
 
             # add for qwen3_vl deepstack
             if use_deepstack:
@@ -1095,11 +1113,13 @@ def general_mm_embed_routine(
             forward_batch.mm_inputs = None
             forward_batch.mm_input_embeds = input_embeds
         else:
-            input_embeds = embed_tokens(input_ids)
+            with _qwen35_mm_trace_span("_qwen35_mmsplit_text_embed"):
+                input_embeds = embed_tokens(input_ids)
         # Copy to pre-allocated buffer if available (for CUDA graph address stability)
         if forward_batch.input_embeds is not None:
-            forward_batch.input_embeds.copy_(input_embeds)
-            input_embeds = forward_batch.input_embeds
+            with _qwen35_mm_trace_span("_qwen35_mmsplit_embed_copy"):
+                forward_batch.input_embeds.copy_(input_embeds)
+                input_embeds = forward_batch.input_embeds
     else:
         input_embeds = None
 

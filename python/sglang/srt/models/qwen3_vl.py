@@ -14,8 +14,10 @@
 # ==============================================================================
 """Inference-only Qwen3-VL model compatible with HuggingFace weights."""
 
+import os
 import logging
 import re
+from contextlib import nullcontext
 from collections import defaultdict
 from functools import lru_cache, partial
 from typing import Callable, Iterable, List, Optional, Tuple, Union
@@ -24,6 +26,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from einops import rearrange
+from torch.autograd.profiler import record_function
 from transformers.activations import ACT2FN
 
 from sglang.srt.configs.qwen3_vl import Qwen3VLConfig, Qwen3VLVisionConfig
@@ -72,10 +75,13 @@ from sglang.srt.models.utils import (
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, is_npu, round_up
+from sglang.srt.utils import add_prefix, get_bool_env_var, is_npu, round_up
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 _is_npu = is_npu()
+_use_unifyinfer_qwen35_trace_mm_split = get_bool_env_var(
+    "UNIFYINFER_QWEN35_TRACE_MM_SPLIT"
+)
 graph_runners_dict = defaultdict(lambda: ViTCudaGraphRunner)
 if _is_npu:
     from sglang.srt.hardware_backend.npu.graph_runner.vit_npu_graph_runner import (
@@ -86,6 +92,12 @@ if _is_npu:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _qwen35_mm_trace_span(name: str):
+    if not _use_unifyinfer_qwen35_trace_mm_split:
+        return nullcontext()
+    return record_function(name)
 
 
 class Qwen3_VisionMLP(nn.Module):
@@ -1077,15 +1089,21 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
         self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
 
-        self.visual = Qwen3VLMoeVisionModel(
-            config.vision_config,
-            # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
-            # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
-            quant_config=None,
-            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-            prefix=add_prefix("model.visual", prefix),
-            use_data_parallel=self.use_data_parallel,
+        self.force_text_only = getattr(config, "language_only", False) or (
+            os.getenv("UNIFYINFER_QWEN35_TEXT_ONLY") == "1"
         )
+
+        self.visual = None
+        if not self.force_text_only:
+            self.visual = Qwen3VLMoeVisionModel(
+                config.vision_config,
+                # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
+                # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
+                quant_config=None,
+                norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+                prefix=add_prefix("model.visual", prefix),
+                use_data_parallel=self.use_data_parallel,
+            )
 
         # TODO: make it more elegant
         if language_model_cls is Qwen3LLMModel:
@@ -1093,7 +1111,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         else:
             self.config = config.text_config  # for qwen3-omni / qwen3-vl-moe
             self.config.encoder_only = getattr(config, "encoder_only", False)
-            self.config.language_only = getattr(config, "language_only", False)
+            self.config.language_only = self.force_text_only
             # Propagate tie_word_embeddings from parent config. In transformers
             # v5.5.3+, Qwen3VLMoeTextConfig sets tie_word_embeddings=True by
             # default but the actual model checkpoint has a separate lm_head.
@@ -1168,6 +1186,8 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        if self.visual is None:
+            raise ValueError("image inputs are unavailable in language_only mode")
         # in qwen-vl, last dim is the same
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
             self.visual.dtype
@@ -1176,17 +1196,20 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
 
-        if self.use_data_parallel:
-            return run_dp_sharded_mrope_vision_model(
-                self.visual,
-                pixel_values,
-                image_grid_thw.tolist(),
-                rope_type="rope_3d",
-            )
-        else:
-            return self.visual(pixel_values, grid_thw=image_grid_thw)
+        with _qwen35_mm_trace_span("_qwen35_mmsplit_image_feature"):
+            if self.use_data_parallel:
+                return run_dp_sharded_mrope_vision_model(
+                    self.visual,
+                    pixel_values,
+                    image_grid_thw.tolist(),
+                    rope_type="rope_3d",
+                )
+            else:
+                return self.visual(pixel_values, grid_thw=image_grid_thw)
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        if self.visual is None:
+            raise ValueError("video inputs are unavailable in language_only mode")
         # in qwen-vl, last dim is the same
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
             self.visual.dtype
@@ -1194,12 +1217,16 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         video_grid_thw = torch.concat([item.video_grid_thw for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert video_grid_thw.dim() == 2, video_grid_thw.dim()
-        if self.use_data_parallel:
-            return run_dp_sharded_mrope_vision_model(
-                self.visual, pixel_values, video_grid_thw.tolist(), rope_type="rope_3d"
-            )
-        else:
-            video_embeds = self.visual(pixel_values, grid_thw=video_grid_thw)
+        with _qwen35_mm_trace_span("_qwen35_mmsplit_video_feature"):
+            if self.use_data_parallel:
+                return run_dp_sharded_mrope_vision_model(
+                    self.visual,
+                    pixel_values,
+                    video_grid_thw.tolist(),
+                    rope_type="rope_3d",
+                )
+            else:
+                video_embeds = self.visual(pixel_values, grid_thw=video_grid_thw)
         return video_embeds
 
     def get_input_embeddings(self):

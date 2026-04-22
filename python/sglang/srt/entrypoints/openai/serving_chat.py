@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import os
 import time
 import uuid
 from http import HTTPStatus
@@ -285,10 +286,22 @@ class OpenAIServingChat(OpenAIServingBase):
             request.reasoning_effort = reasoning_effort
 
         """Convert OpenAI chat completion request to internal format"""
-        is_multimodal = self.tokenizer_manager.model_config.is_multimodal
+        force_text_only = os.getenv("UNIFYINFER_QWEN35_TEXT_ONLY") == "1"
+        is_multimodal = (
+            self.tokenizer_manager.model_config.is_multimodal and not force_text_only
+        )
 
         # Process messages and apply chat template
         processed_messages = self._process_messages(request, is_multimodal)
+
+        if force_text_only and (
+            processed_messages.image_data is not None
+            or processed_messages.video_data is not None
+            or processed_messages.audio_data is not None
+        ):
+            raise ValueError(
+                "UNIFYINFER_QWEN35_TEXT_ONLY=1 only supports pure-text chat requests."
+            )
 
         # Build sampling parameters
         sampling_params = request.to_sampling_params(

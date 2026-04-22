@@ -53,12 +53,12 @@ from sglang.srt.eplb.expert_location_dispatch import (
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import get_moe_runner_backend
 from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
-from sglang.srt.layers.moe.utils import is_deepep_class_backend
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
     get_compiler_backend,
+    get_int_env_var,
     is_cpu,
     is_cuda,
     is_hip,
@@ -66,6 +66,19 @@ from sglang.srt.utils import (
     is_xpu,
 )
 from sglang.srt.utils.patch_torch import register_fake_if_exists
+
+try:
+    from sglang.srt.layers.moe.utils import is_deepep_class_backend
+except ImportError:
+    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+    def is_deepep_class_backend() -> bool:
+        backend = get_moe_a2a_backend()
+        return (
+            backend.is_deepep()
+            or backend.is_mooncake()
+            or (hasattr(backend, "is_mori") and backend.is_mori())
+        )
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization import QuantizationConfig
@@ -80,6 +93,23 @@ _is_xpu = is_xpu()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_disable_aiter_moe_topk = (
+    get_bool_env_var("UNIFYINFER_DISABLE_AITER_MOE_TOPK") and _is_hip
+)
+_use_aiter_moe_topk = _use_aiter and not _disable_aiter_moe_topk
+_unifyinfer_qwen35_moe_token_round_multiple = (
+    get_int_env_var("UNIFYINFER_QWEN35_MOE_TOKEN_ROUND_MULTIPLE", 0) if _is_hip else 0
+)
+_unifyinfer_qwen35_moe_token_round_native = (
+    get_bool_env_var("UNIFYINFER_QWEN35_MOE_TOKEN_ROUND_NATIVE") and _is_hip
+)
+_unifyinfer_qwen35_moe_token_round_native_candidate_pool = (
+    get_int_env_var("UNIFYINFER_QWEN35_MOE_TOKEN_ROUND_NATIVE_CANDIDATE_POOL", 64)
+    if _is_hip
+    else 0
+)
+_logged_unifyinfer_qwen35_moe_token_round = False
+_logged_unifyinfer_qwen35_moe_token_round_native = False
 
 if _is_cuda:
     from sgl_kernel import moe_fused_gate
@@ -517,7 +547,7 @@ def fused_topk(
     topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
 
     if scoring_func == "softmax":
-        if _use_aiter:
+        if _use_aiter_moe_topk:
 
             # Use fused_topk instead of topk_softmax to auto dispatch to the correct kernel
             topk_weights, topk_ids = aiter_fused_topk(
@@ -756,6 +786,312 @@ def is_power_of_two(n):
     return n > 0 and math.log2(n).is_integer()
 
 
+def _round_counts_to_tile_multiple(
+    counts: torch.Tensor, tile_multiple: int
+) -> torch.Tensor:
+    if tile_multiple <= 0:
+        raise ValueError("tile_multiple must be positive")
+
+    counts_cpu = counts.to(torch.int64).cpu()
+    total_assignments = int(counts_cpu.sum().item())
+    if total_assignments % tile_multiple != 0:
+        raise ValueError(
+            f"total_assignments={total_assignments} is not divisible by tile_multiple={tile_multiple}"
+        )
+
+    floored = (counts_cpu // tile_multiple) * tile_multiple
+    remainders = counts_cpu - floored
+    remainder_total = int(remainders.sum().item())
+    if remainder_total % tile_multiple != 0:
+        raise ValueError(
+            "sum of remainders must be divisible by tile_multiple for exact rounding"
+        )
+
+    num_round_ups = remainder_total // tile_multiple
+    candidate_indices = torch.nonzero(remainders > 0, as_tuple=False).view(-1).tolist()
+    candidate_indices.sort(
+        key=lambda idx: (
+            int(remainders[idx].item()),
+            int(counts_cpu[idx].item()),
+            -idx,
+        ),
+        reverse=True,
+    )
+    if num_round_ups > len(candidate_indices):
+        raise ValueError("not enough non-zero experts for tile-aligned rounding")
+
+    rounded = floored.clone()
+    for idx in candidate_indices[:num_round_ups]:
+        rounded[idx] += tile_multiple
+
+    if int(rounded.sum().item()) != total_assignments:
+        raise ValueError("rounded counts no longer preserve total_assignments")
+
+    return rounded
+
+
+def _compute_token_round_scores(
+    router_logits: torch.Tensor,
+    scoring_func: str,
+) -> torch.Tensor:
+    router_logits = router_logits.float()
+    if scoring_func == "softmax":
+        return torch.softmax(router_logits, dim=-1)
+    if scoring_func == "sigmoid":
+        return torch.sigmoid(router_logits)
+    raise ValueError(f"Invalid scoring function for token rounding: {scoring_func}")
+
+
+def _padded_token_total(counts: torch.Tensor, tile_multiple: int) -> int:
+    rounded_up = (counts + tile_multiple - 1) // tile_multiple * tile_multiple
+    return int(rounded_up.sum().item())
+
+
+def _apply_unifyinfer_qwen35_token_rounding_native(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_config: TopKConfig,
+    router_logits: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    tile_multiple = _unifyinfer_qwen35_moe_token_round_multiple
+    num_tokens, topk = topk_ids.shape
+    num_experts = router_logits.shape[1]
+    candidate_pool = min(
+        num_experts,
+        max(topk + 1, _unifyinfer_qwen35_moe_token_round_native_candidate_pool),
+    )
+
+    counts = torch.bincount(topk_ids.view(-1).to(torch.int64), minlength=num_experts)
+    original_padded_tokens = _padded_token_total(counts.to(torch.int64).cpu(), tile_multiple)
+    try:
+        target_counts = _round_counts_to_tile_multiple(counts, tile_multiple)
+    except ValueError:
+        return topk_ids, topk_weights
+
+    counts_cpu = counts.to(torch.int64).cpu()
+    surplus = (counts_cpu - target_counts).clamp_min(0).tolist()
+    deficit = (target_counts - counts_cpu).clamp_min(0).tolist()
+    total_moves_needed = sum(deficit)
+    if total_moves_needed == 0:
+        return topk_ids, topk_weights
+
+    scores = _compute_token_round_scores(router_logits, topk_config.scoring_func)
+    donor_scores = scores.gather(1, topk_ids.to(torch.int64))
+    donor_order = torch.argsort(donor_scores.view(-1), descending=False).cpu().tolist()
+    candidate_ids = (
+        torch.topk(scores, k=candidate_pool, dim=-1, largest=True, sorted=True)
+        .indices.to(torch.int64)
+        .cpu()
+        .tolist()
+    )
+
+    topk_ids_cpu = topk_ids.to(torch.int64).cpu()
+    routed_ids = [row.tolist() for row in topk_ids_cpu]
+    selected_sets = [set(row) for row in routed_ids]
+
+    moves_made = 0
+    for flat_idx in donor_order:
+        token_idx = flat_idx // topk
+        slot_idx = flat_idx % topk
+        donor = routed_ids[token_idx][slot_idx]
+        if donor < 0 or surplus[donor] <= 0:
+            continue
+
+        replacement = None
+        selected = selected_sets[token_idx]
+        for expert_id in candidate_ids[token_idx]:
+            if deficit[expert_id] <= 0 or expert_id in selected:
+                continue
+            replacement = expert_id
+            break
+
+        if replacement is None:
+            continue
+
+        selected.remove(donor)
+        selected.add(replacement)
+        routed_ids[token_idx][slot_idx] = replacement
+        surplus[donor] -= 1
+        deficit[replacement] -= 1
+        moves_made += 1
+        total_moves_needed -= 1
+        if total_moves_needed == 0:
+            break
+
+    if total_moves_needed > 0:
+        remaining_experts = [
+            expert_id for expert_id, remaining_need in enumerate(deficit) if remaining_need > 0
+        ]
+        if remaining_experts:
+            remaining_candidate_ranks = torch.argsort(
+                scores[:, remaining_experts].cpu(),
+                dim=-1,
+                descending=True,
+            ).tolist()
+            for flat_idx in donor_order:
+                token_idx = flat_idx // topk
+                slot_idx = flat_idx % topk
+                donor = routed_ids[token_idx][slot_idx]
+                if donor < 0 or surplus[donor] <= 0:
+                    continue
+
+                replacement = None
+                selected = selected_sets[token_idx]
+                for remaining_rank in remaining_candidate_ranks[token_idx]:
+                    expert_id = remaining_experts[remaining_rank]
+                    if deficit[expert_id] <= 0 or expert_id in selected:
+                        continue
+                    replacement = expert_id
+                    break
+
+                if replacement is None:
+                    continue
+
+                selected.remove(donor)
+                selected.add(replacement)
+                routed_ids[token_idx][slot_idx] = replacement
+                surplus[donor] -= 1
+                deficit[replacement] -= 1
+                moves_made += 1
+                total_moves_needed -= 1
+                if total_moves_needed == 0:
+                    break
+
+    if moves_made == 0:
+        return topk_ids, topk_weights
+
+    new_topk_ids = torch.tensor(
+        routed_ids, dtype=torch.int32, device=topk_ids.device
+    )
+    new_counts = torch.bincount(new_topk_ids.view(-1).to(torch.int64), minlength=num_experts)
+    new_padded_tokens = _padded_token_total(new_counts.to(torch.int64).cpu(), tile_multiple)
+    if new_padded_tokens >= original_padded_tokens:
+        return topk_ids, topk_weights
+
+    new_topk_weights = scores.gather(1, new_topk_ids)
+    if topk_config.renormalize:
+        new_topk_weights = new_topk_weights / new_topk_weights.sum(
+            dim=-1, keepdim=True
+        )
+
+    global _logged_unifyinfer_qwen35_moe_token_round_native
+    if not _logged_unifyinfer_qwen35_moe_token_round_native:
+        logger.info(
+            "Enabled UNIFYINFER_QWEN35_MOE_TOKEN_ROUND_NATIVE=1 with MULTIPLE=%s and CANDIDATE_POOL=%s for lower-overhead MoE token rounding",
+            tile_multiple,
+            candidate_pool,
+        )
+        _logged_unifyinfer_qwen35_moe_token_round_native = True
+
+    return new_topk_ids.to(torch.int32), new_topk_weights.to(torch.float32)
+
+
+def _apply_unifyinfer_qwen35_token_rounding(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_config: TopKConfig,
+    router_logits: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    tile_multiple = _unifyinfer_qwen35_moe_token_round_multiple
+    if tile_multiple <= 0 or topk_ids.numel() == 0:
+        return topk_ids, topk_weights
+    if topk_ids.shape[1] == 0 or (topk_ids < 0).any():
+        return topk_ids, topk_weights
+    if (
+        topk_config.use_grouped_topk
+        or topk_config.correction_bias is not None
+        or topk_config.num_fused_shared_experts > 0
+    ):
+        return topk_ids, topk_weights
+
+    if _unifyinfer_qwen35_moe_token_round_native:
+        return _apply_unifyinfer_qwen35_token_rounding_native(
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            topk_config=topk_config,
+            router_logits=router_logits,
+        )
+
+    num_tokens, topk = topk_ids.shape
+    total_assignments = num_tokens * topk
+    if total_assignments % tile_multiple != 0:
+        return topk_ids, topk_weights
+
+    num_experts = router_logits.shape[1]
+    counts = torch.bincount(topk_ids.view(-1).to(torch.int64), minlength=num_experts)
+    counts_cpu = counts.to(torch.int64).cpu()
+    try:
+        target_counts = _round_counts_to_tile_multiple(counts_cpu, tile_multiple)
+    except ValueError:
+        return topk_ids, topk_weights
+
+    surplus = (counts_cpu - target_counts).clamp_min(0).tolist()
+    deficit = (target_counts - counts_cpu).clamp_min(0).tolist()
+    total_moves_needed = sum(deficit)
+    if total_moves_needed == 0:
+        return topk_ids, topk_weights
+
+    scores = _compute_token_round_scores(router_logits, topk_config.scoring_func)
+    donor_scores = scores.gather(1, topk_ids.to(torch.int64))
+    donor_order = torch.argsort(donor_scores.view(-1), descending=False).cpu().tolist()
+    candidate_ranks = torch.argsort(scores, dim=-1, descending=True).cpu().tolist()
+
+    topk_ids_cpu = topk_ids.to(torch.int64).cpu()
+    routed_ids = [row.tolist() for row in topk_ids_cpu]
+    selected_sets = [set(row) for row in routed_ids]
+
+    moves_made = 0
+    for flat_idx in donor_order:
+        token_idx = flat_idx // topk
+        slot_idx = flat_idx % topk
+        donor = routed_ids[token_idx][slot_idx]
+        if donor < 0 or surplus[donor] <= 0:
+            continue
+
+        replacement = None
+        selected = selected_sets[token_idx]
+        for expert_id in candidate_ranks[token_idx]:
+            if deficit[expert_id] <= 0 or expert_id in selected:
+                continue
+            replacement = expert_id
+            break
+
+        if replacement is None:
+            continue
+
+        selected.remove(donor)
+        selected.add(replacement)
+        routed_ids[token_idx][slot_idx] = replacement
+        surplus[donor] -= 1
+        deficit[replacement] -= 1
+        moves_made += 1
+        total_moves_needed -= 1
+        if total_moves_needed == 0:
+            break
+
+    if moves_made == 0:
+        return topk_ids, topk_weights
+
+    new_topk_ids = torch.tensor(
+        routed_ids, dtype=torch.int32, device=topk_ids.device
+    )
+    new_topk_weights = scores.gather(1, new_topk_ids.to(torch.int64))
+    if topk_config.renormalize:
+        new_topk_weights = new_topk_weights / new_topk_weights.sum(
+            dim=-1, keepdim=True
+        )
+
+    global _logged_unifyinfer_qwen35_moe_token_round
+    if not _logged_unifyinfer_qwen35_moe_token_round:
+        logger.info(
+            "Enabled UNIFYINFER_QWEN35_MOE_TOKEN_ROUND_MULTIPLE=%s for plain top-k MoE token rounding",
+            tile_multiple,
+        )
+        _logged_unifyinfer_qwen35_moe_token_round = True
+
+    return new_topk_ids, new_topk_weights.to(torch.float32)
+
+
 def _mask_topk_ids_padded_region(
     topk_ids: torch.Tensor,
     num_token_non_padded: Optional[torch.Tensor] = None,
@@ -869,7 +1205,7 @@ def biased_grouped_topk_gpu(
 
         return topk_weights, topk_ids
 
-    elif _use_aiter:
+    elif _use_aiter_moe_topk:
         assert not apply_routed_scaling_factor_on_output, "Not implemented"
         token = gating_output.shape[0]
         device = gating_output.device
@@ -1012,10 +1348,6 @@ def _post_process_topk_ids(
     fused_shared_experts_scaling_factor = (
         topk_config.fused_shared_experts_scaling_factor
     )
-    get_global_experts_capturer().capture(
-        layer_id=layer_id,
-        topk_ids=topk_ids,
-    )
     if _is_cuda:
         # When shared experts are fused (appended as extra columns in topk_ids),
         # EPLB dispatch must only remap the routed expert columns.
@@ -1033,7 +1365,7 @@ def _post_process_topk_ids(
                 topk_ids, expert_location_dispatch_info, num_token_non_padded
             )
 
-    if num_fused_shared_experts > 0 and _use_aiter:
+    if num_fused_shared_experts > 0 and _use_aiter_moe_topk:
         M, N = router_logits.shape
         scale_factor = (
             1.0
@@ -1065,6 +1397,16 @@ def _post_process_topk_ids(
             topk_config,
         )
 
+    topk_ids, topk_weights = _apply_unifyinfer_qwen35_token_rounding(
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        topk_config=topk_config,
+        router_logits=router_logits,
+    )
+    get_global_experts_capturer().capture(
+        layer_id=layer_id,
+        topk_ids=topk_ids,
+    )
     return topk_ids, topk_weights
 
 
@@ -1112,7 +1454,7 @@ def select_experts(
             topk_weights, topk_ids = grouped_topk(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
-                topk=num_routed_topk if _use_aiter else top_k,
+                topk=num_routed_topk if _use_aiter_moe_topk else top_k,
                 renormalize=renormalize,
                 num_expert_group=num_expert_group,
                 topk_group=topk_group,
@@ -1125,7 +1467,7 @@ def select_experts(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
                 correction_bias=correction_bias,
-                topk=num_routed_topk if _use_aiter else top_k,
+                topk=num_routed_topk if _use_aiter_moe_topk else top_k,
                 renormalize=renormalize,
                 num_expert_group=num_expert_group,
                 topk_group=topk_group,
@@ -1142,7 +1484,7 @@ def select_experts(
         topk_weights, topk_ids = fused_topk_native(
             hidden_states=hidden_states,
             gating_output=router_logits,
-            topk=num_routed_topk if _use_aiter else top_k,
+            topk=num_routed_topk if _use_aiter_moe_topk else top_k,
             renormalize=renormalize,
             correction_bias=correction_bias,
             scoring_func=scoring_func,
@@ -1158,7 +1500,7 @@ def select_experts(
             topk_weights, topk_ids = fused_topk_softmax_torch_raw_logits(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
-                topk=num_routed_topk if _use_aiter else top_k,
+                topk=num_routed_topk if _use_aiter_moe_topk else top_k,
                 renormalize=renormalize,
             )
         else:
@@ -1166,7 +1508,7 @@ def select_experts(
             topk_weights, topk_ids = fused_topk(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
-                topk=num_routed_topk if _use_aiter else top_k,
+                topk=num_routed_topk if _use_aiter_moe_topk else top_k,
                 renormalize=renormalize,
                 correction_bias=correction_bias,
                 scoring_func=scoring_func,
@@ -1180,7 +1522,7 @@ def select_experts(
         topk_weights, topk_ids = custom_routing_function(
             hidden_states=hidden_states,
             gating_output=router_logits,
-            topk=num_routed_topk if _use_aiter else top_k,
+            topk=num_routed_topk if _use_aiter_moe_topk else top_k,
             renormalize=renormalize,
         )
 

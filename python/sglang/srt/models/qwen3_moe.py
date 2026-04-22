@@ -17,12 +17,14 @@
 
 """Inference-only Qwen3MoE model compatible with HuggingFace weights."""
 
+from contextlib import nullcontext
 import logging
 import math
 from typing import Any, Dict, Iterable, List, Optional, Tuple, TypeVar
 
 import torch
 from torch import nn
+from torch.autograd.profiler import record_function
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
@@ -82,6 +84,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
+    get_bool_env_var,
     is_cuda,
     is_flashinfer_available,
     is_non_idle_and_non_empty,
@@ -106,9 +109,18 @@ _is_flashinfer_available = is_flashinfer_available()
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_use_unifyinfer_qwen3_trace_attn_split = get_bool_env_var(
+    "UNIFYINFER_QWEN3_TRACE_ATTN_SPLIT"
+)
 
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
+
+
+def _qwen3_trace_span(name: str):
+    if not _use_unifyinfer_qwen3_trace_attn_split:
+        return nullcontext()
+    return record_function(name)
 
 
 def compute_yarn_parameters(
@@ -584,7 +596,8 @@ class Qwen3MoeAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        qkv, _ = self.qkv_proj(hidden_states)
+        with _qwen3_trace_span("_qwen3_attnsplit_proj"):
+            qkv, _ = self.qkv_proj(hidden_states)
 
         q, k, v = self.apply_qk_norm_rope(qkv, positions, forward_batch)
 
@@ -620,30 +633,33 @@ class Qwen3MoeAttention(nn.Module):
             self._used_fused_qk_norm_rope_last_call = True
         else:
             # Fallback to non-fused QK Norm & RoPE implementation
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            q, k = apply_qk_norm(
-                q=q,
-                k=k,
-                q_norm=self.q_norm,
-                k_norm=self.k_norm,
-                head_dim=self.head_dim,
-                alt_stream=self.alt_stream,
-            )
-            q, k = self.rotary_emb(
-                positions,
-                q,
-                k,
-                fused_set_kv_buffer_arg=(
-                    create_fused_set_kv_buffer_arg(
-                        value=v,
-                        layer=self.attn,
-                        forward_batch=forward_batch,
-                    )
-                    if enable_fused_set_kv_buffer(forward_batch)
-                    and self.compatible_with_fused_kv_buffer
-                    else None
-                ),
-            )
+            with _qwen3_trace_span("_qwen3_attnsplit_split"):
+                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            with _qwen3_trace_span("_qwen3_attnsplit_qknorm"):
+                q, k = apply_qk_norm(
+                    q=q,
+                    k=k,
+                    q_norm=self.q_norm,
+                    k_norm=self.k_norm,
+                    head_dim=self.head_dim,
+                    alt_stream=self.alt_stream,
+                )
+            with _qwen3_trace_span("_qwen3_attnsplit_rotary"):
+                q, k = self.rotary_emb(
+                    positions,
+                    q,
+                    k,
+                    fused_set_kv_buffer_arg=(
+                        create_fused_set_kv_buffer_arg(
+                            value=v,
+                            layer=self.attn,
+                            forward_batch=forward_batch,
+                        )
+                        if enable_fused_set_kv_buffer(forward_batch)
+                        and self.compatible_with_fused_kv_buffer
+                        else None
+                    ),
+                )
             self._used_fused_qk_norm_rope_last_call = False
         return q, k, v
 
@@ -683,14 +699,16 @@ class Qwen3MoeAttention(nn.Module):
             enable_fused_set_kv_buffer(forward_batch)
             and self.compatible_with_fused_kv_buffer
         )
-        attn_output = self.attn(
-            q,
-            k,
-            v,
-            fb,
-            save_kv_cache=save_kv_cache,
-        )
-        output, _ = self.o_proj(attn_output)
+        with _qwen3_trace_span("_qwen3_attnsplit_core"):
+            attn_output = self.attn(
+                q,
+                k,
+                v,
+                fb,
+                save_kv_cache=save_kv_cache,
+            )
+        with _qwen3_trace_span("_qwen3_attnsplit_outproj"):
+            output, _ = self.o_proj(attn_output)
         return output
 
     def forward(

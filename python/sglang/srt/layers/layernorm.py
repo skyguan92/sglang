@@ -43,6 +43,8 @@ _is_flashinfer_available = is_flashinfer_available()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_disable_aiter_rmsnorm = get_bool_env_var("UNIFYINFER_DISABLE_AITER_RMSNORM") and _is_hip
+_use_aiter_rmsnorm = _use_aiter and not _disable_aiter_rmsnorm
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
@@ -69,10 +71,12 @@ _has_aiter_layer_norm = False
 _has_vllm_rms_norm = False
 if _use_aiter:
     from aiter import layernorm2d_fwd as layer_norm
+
+    _has_aiter_layer_norm = True  # aiter provides the layer_norm functions
+if _use_aiter_rmsnorm:
     from aiter import rmsnorm2d_fwd as rms_norm
     from aiter import rmsnorm2d_fwd_with_add as fused_add_rms_norm
 
-    _has_aiter_layer_norm = True  # aiter provides the layer_norm functions
     _has_vllm_rms_norm = True  # aiter provides the rms_norm functions
 elif _is_hip:
     try:
@@ -123,7 +127,7 @@ def _forward_with_allreduce_fusion(
                 residual = residual + post_residual_addition
 
             # Prefer AITER fused AR+RMSNorm when enabled on AMD.
-            if _use_aiter:
+            if _use_aiter_rmsnorm:
                 fused_result = tensor_model_parallel_fused_allreduce_rmsnorm(
                     x, residual, weight, norm_module.variance_epsilon
                 )
@@ -141,7 +145,10 @@ def _forward_with_allreduce_fusion(
                     return fused_result
 
             # For AITER route, preserve correctness when fused path is unavailable.
-            if _use_aiter and get_global_server_args().enable_aiter_allreduce_fusion:
+            if (
+                _use_aiter_rmsnorm
+                and get_global_server_args().enable_aiter_allreduce_fusion
+            ):
                 x = tensor_model_parallel_all_reduce(x)
                 return norm_module.forward(x, residual, None)
 
@@ -174,7 +181,7 @@ class RMSNorm(MultiPlatformOp):
         self.variance_size_override = (
             None if var_hidden_size == hidden_size else var_hidden_size
         )
-        if _use_aiter:
+        if _use_aiter_rmsnorm:
             self._forward_method = self.forward_aiter
 
     def forward_cuda(
@@ -537,7 +544,7 @@ class GemmaRMSNorm(MultiPlatformOp):
             return self.forward_native(x, residual, post_residual_addition)
 
         w = self.weight.data + 1.0
-        if _use_aiter:
+        if _use_aiter_rmsnorm:
             # aiter API: rms_norm(input, weight, eps) -> output
             #            fused_add_rms_norm(output, input, residual, residual_out, weight, eps)
             if residual is not None:

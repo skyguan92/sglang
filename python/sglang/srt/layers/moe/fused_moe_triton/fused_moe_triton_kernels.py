@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 import torch
 import triton
 import triton.language as tl
+import triton.language.extra.libdevice as tldevice
 
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.layers.moe.utils import get_moe_padding_size
@@ -41,6 +42,9 @@ _is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_unifyinfer_hip_mmq_port = (
+    get_bool_env_var("UNIFYINFER_FUSED_MOE_HIP_MMQ_PORT") and _is_hip
+)
 
 if _is_cuda:
     pass
@@ -77,11 +81,11 @@ def write_zeros_to_output(
     N,
     offs_token,
     token_mask,
-    BLOCK_SIZE_M,
+    BLOCK_SIZE_M_PADDED,
     BLOCK_SIZE_N,
     compute_type,
 ):
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=compute_type)
+    accumulator = tl.zeros((BLOCK_SIZE_M_PADDED, BLOCK_SIZE_N), dtype=compute_type)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
@@ -125,6 +129,7 @@ def fused_moe_kernel_gptq_awq(
     group_size: tl.constexpr,
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_M_PADDED: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
@@ -179,14 +184,20 @@ def fused_moe_kernel_gptq_awq(
     # Create pointers for the first blocks of A and B.
     # We will advance this pointer as we move in the K direction
     # and accumulate
-    # `a_ptrs` is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
+    # `a_ptrs` is a block of [BLOCK_SIZE_M_PADDED, BLOCK_SIZE_K] pointers.
     # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
     if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
         return
-    offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
-    offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
-    token_mask = offs_token < num_valid_tokens
+    offs_block = tl.arange(0, BLOCK_SIZE_M_PADDED)
+    logical_token_mask = offs_block < BLOCK_SIZE_M
+    offs_token_id = pid_m * BLOCK_SIZE_M + offs_block.to(tl.int64)
+    offs_token = tl.load(
+        sorted_token_ids_ptr + offs_token_id,
+        mask=logical_token_mask,
+        other=num_valid_tokens,
+    )
+    token_mask = logical_token_mask & (offs_token < num_valid_tokens)
 
     off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
     if filter_expert and off_experts == -1:
@@ -201,7 +212,7 @@ def fused_moe_kernel_gptq_awq(
             N,
             offs_token,
             token_mask,
-            BLOCK_SIZE_M,
+            BLOCK_SIZE_M_PADDED,
             BLOCK_SIZE_N,
             compute_type,
         )
@@ -238,10 +249,10 @@ def fused_moe_kernel_gptq_awq(
 
     # -----------------------------------------------------------
     # Iterate to compute a block of the C matrix.
-    # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block
+    # We accumulate into a `[BLOCK_SIZE_M_PADDED, BLOCK_SIZE_N]` block
     # of fp32 values for higher accuracy.
     # `accumulator` will be converted back to fp16 after the loop.
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    accumulator = tl.zeros((BLOCK_SIZE_M_PADDED, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         # Load the next block of A and B, generate a mask by checking the
         # K dimension.
@@ -364,6 +375,7 @@ def fused_moe_kernel(
     group_k: tl.constexpr,
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_M_PADDED: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
@@ -426,15 +438,21 @@ def fused_moe_kernel(
     # Create pointers for the first blocks of A and B.
     # We will advance this pointer as we move in the K direction
     # and accumulate
-    # `a_ptrs` is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
+    # `a_ptrs` is a block of [BLOCK_SIZE_M_PADDED, BLOCK_SIZE_K] pointers.
     # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
     if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
         return
-    offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
-    offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
+    offs_block = tl.arange(0, BLOCK_SIZE_M_PADDED)
+    logical_token_mask = offs_block < BLOCK_SIZE_M
+    offs_token_id = pid_m * BLOCK_SIZE_M + offs_block.to(tl.int64)
+    offs_token = tl.load(
+        sorted_token_ids_ptr + offs_token_id,
+        mask=logical_token_mask,
+        other=num_valid_tokens,
+    )
     offs_token = offs_token.to(tl.int64)
-    token_mask = offs_token < num_valid_tokens
+    token_mask = logical_token_mask & (offs_token < num_valid_tokens)
 
     off_experts_i32 = tl.load(expert_ids_ptr + pid_m)
     off_experts = off_experts_i32.to(tl.int64)
@@ -453,7 +471,7 @@ def fused_moe_kernel(
                 N,
                 offs_token,
                 token_mask,
-                BLOCK_SIZE_M,
+                BLOCK_SIZE_M_PADDED,
                 BLOCK_SIZE_N,
                 compute_type,
             )
@@ -518,13 +536,13 @@ def fused_moe_kernel(
 
     # -----------------------------------------------------------
     # Iterate to compute a block of the C matrix.
-    # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block
+    # We accumulate into a `[BLOCK_SIZE_M_PADDED, BLOCK_SIZE_N]` block
     # of fp32 values for higher accuracy.
     # `accumulator` will be converted back to fp16 after the loop.
     if swap_ab:
-        accumulator = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
+        accumulator = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M_PADDED), dtype=tl.float32)
     else:
-        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        accumulator = tl.zeros((BLOCK_SIZE_M_PADDED, BLOCK_SIZE_N), dtype=tl.float32)
 
     for k_start in range(0, K, BLOCK_SIZE_K):
         # Load the next block of A and B, generate a mask by checking the
@@ -735,6 +753,12 @@ def invoke_fused_moe_kernel(
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
 
+    config = dict(config)
+    config.setdefault(
+        "BLOCK_SIZE_M_PADDED",
+        triton.next_power_of_2(config["BLOCK_SIZE_M"]),
+    )
+
     if use_fp8_w8a8:
         swap_ab = should_enable_swap_ab(config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"])
     else:
@@ -860,6 +884,10 @@ def invoke_fused_moe_kernel(
 
     else:
         if a_use_tma or b_use_tma:
+            if config["BLOCK_SIZE_M_PADDED"] != config["BLOCK_SIZE_M"]:
+                raise ValueError(
+                    "Non-power-of-two logical BLOCK_SIZE_M requires the non-TMA path."
+                )
             _set_triton_tma_allocator()
 
         if a_use_tma:
@@ -936,7 +964,11 @@ def tanh(x):
 
 
 @triton.jit
-def _apply_activation(x, ACTIVATION_TYPE: tl.constexpr):
+def _apply_activation(
+    x,
+    ACTIVATION_TYPE: tl.constexpr,
+    USE_FAST_SILU: tl.constexpr,
+):
     """
     Apply activation function based on compile-time constant.
 
@@ -949,6 +981,8 @@ def _apply_activation(x, ACTIVATION_TYPE: tl.constexpr):
     """
     x = x.to(tl.float32)
     if ACTIVATION_TYPE == "silu":
+        if USE_FAST_SILU:
+            return x / (1.0 + tldevice.fast_expf(-x))
         return x * tl.sigmoid(x)
     elif ACTIVATION_TYPE == "gelu":
         kAlpha = 0.7978845608028654
@@ -966,6 +1000,7 @@ def act_and_mul_kernel(
     expert_step: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     ACTIVATION_TYPE: tl.constexpr,
+    USE_FAST_SILU: tl.constexpr,
 ):
     """
     Unified activation and multiply kernel that handles both sorted and unsorted routing,
@@ -994,7 +1029,11 @@ def act_and_mul_kernel(
         gate_output = tl.load(gate_output_ptr + offset, mask=mask)
         up_output = tl.load(up_output_ptr + offset, mask=mask)
 
-        gate_output_activated = _apply_activation(gate_output, ACTIVATION_TYPE)
+        gate_output_activated = _apply_activation(
+            gate_output,
+            ACTIVATION_TYPE,
+            USE_FAST_SILU,
+        )
         gate_output_activated = gate_output_activated.to(InDtype)
 
         act_mul_output = gate_output_activated * up_output
@@ -1025,6 +1064,7 @@ def act_and_mul_triton(
     hidden_size = gateup_output.shape[1]
     expert_ids_row = topk_ids.view(-1) if not down_moe_use_tma else expert_ids
     expert_step = 1 if not down_moe_use_tma else config["BLOCK_SIZE_M"]
+    use_fast_silu = _use_unifyinfer_hip_mmq_port and activation == "silu"
     act_and_mul_kernel[grid](
         gateup_output,
         down_input,
@@ -1033,6 +1073,7 @@ def act_and_mul_triton(
         expert_step,
         BLOCK_SIZE=512,
         ACTIVATION_TYPE=activation,
+        USE_FAST_SILU=use_fast_silu,
     )
 
 

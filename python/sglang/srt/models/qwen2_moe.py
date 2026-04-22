@@ -17,7 +17,7 @@
 """Inference-only Qwen2MoE model compatible with HuggingFace weights."""
 
 import logging
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -104,15 +104,78 @@ _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_unifyinfer_qwen35_hip_alt_stream = (
+    get_bool_env_var("UNIFYINFER_QWEN35_HIP_ALT_STREAM") and _is_hip
+)
+_use_unifyinfer_qwen35_hip_alt_stream_decode_only = (
+    get_bool_env_var("UNIFYINFER_QWEN35_HIP_ALT_STREAM_DECODE_ONLY") and _is_hip
+)
+_use_unifyinfer_qwen35_hip_alt_stream_shared_expert = (
+    _use_unifyinfer_qwen35_hip_alt_stream
+    or (
+        get_bool_env_var("UNIFYINFER_QWEN35_HIP_ALT_STREAM_SHARED_EXPERT")
+        and _is_hip
+    )
+)
+_use_unifyinfer_qwen35_shared_expert_fusion = (
+    get_bool_env_var("UNIFYINFER_QWEN35_SHARED_EXPERT_FUSION") and _is_hip
+)
+_use_unifyinfer_qwen35_shared_expert_fusion_prefill_only = (
+    get_bool_env_var("UNIFYINFER_QWEN35_SHARED_EXPERT_FUSION_PREFILL_ONLY")
+    and _is_hip
+)
+_use_unifyinfer_qwen35_shared_expert_fusion_prefill_only_decode_unfused_view = (
+    get_bool_env_var(
+        "UNIFYINFER_QWEN35_SHARED_EXPERT_FUSION_PREFILL_ONLY_DECODE_UNFUSED_VIEW"
+    )
+    and _is_hip
+)
+_disable_unifyinfer_qwen35_shared_expert = get_bool_env_var(
+    "UNIFYINFER_QWEN35_DISABLE_SHARED_EXPERT"
+)
+_disable_unifyinfer_qwen35_shared_expert_prefill_only = get_bool_env_var(
+    "UNIFYINFER_QWEN35_DISABLE_SHARED_EXPERT_PREFILL_ONLY"
+)
+
+
+def _should_use_unifyinfer_qwen35_hip_alt_stream_decode_only(
+    forward_batch: Optional[ForwardBatch],
+) -> bool:
+    return (
+        _use_unifyinfer_qwen35_hip_alt_stream_decode_only
+        and forward_batch is not None
+        and forward_batch.forward_mode.is_decode()
+    )
+
+
+def _should_disable_unifyinfer_qwen35_shared_expert(
+    forward_batch: Optional[ForwardBatch],
+) -> bool:
+    return _disable_unifyinfer_qwen35_shared_expert or (
+        _disable_unifyinfer_qwen35_shared_expert_prefill_only
+        and forward_batch is not None
+        and not forward_batch.forward_mode.is_decode()
+    )
+
+
+def _should_use_unifyinfer_qwen35_shared_expert_fusion(
+    forward_batch: Optional[ForwardBatch],
+) -> bool:
+    if not _use_unifyinfer_qwen35_shared_expert_fusion:
+        return False
+    if not _use_unifyinfer_qwen35_shared_expert_fusion_prefill_only:
+        return True
+    return forward_batch is None or not forward_batch.forward_mode.is_decode()
 
 
 def can_fuse_shared_expert(
     config: PretrainedConfig,
     quant_config: Optional[QuantizationConfig],
 ) -> bool:
-    """Whether the shared expert may be fused as an extra MoE expert (Qwen3.5 + Aiter).
+    """Whether the shared expert may be fused as an extra MoE expert.
 
-    Caller must still gate on ``support_shared_expert_fusion`` and ``_use_aiter``.
+    Caller must still gate on ``support_shared_expert_fusion`` and a backend
+    path that can consume the fused shared-expert wiring.
     """
     if (
         get_global_server_args().disable_shared_experts_fusion is True
@@ -224,7 +287,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             self.num_shared_experts = 1
 
         self.enable_shared_expert_fusion = False  # default to False
-        if _use_aiter:
+        if _use_aiter or _use_unifyinfer_qwen35_shared_expert_fusion:
             # enable shared expert fusion when use aiter
             self.enable_shared_expert_fusion = (
                 support_shared_expert_fusion
@@ -232,6 +295,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
         if self.enable_shared_expert_fusion:
             self.num_fused_shared_experts = self.num_shared_experts
+        self.enable_stage_split_shared_expert_fusion = (
+            self.enable_shared_expert_fusion
+            and _use_unifyinfer_qwen35_shared_expert_fusion_prefill_only
+        )
 
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
@@ -271,9 +338,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         # When enable_shared_expert_fusion, the shared expert runs inside the MoE kernel
         # (via _append_shared_to_topk_output); a separate shared_expert MLP would
         # double-count. If fusion is off (num_fused_shared_experts == 0), keep shared_expert.
-        if (
-            config.shared_expert_intermediate_size > 0
-            and not self.enable_shared_expert_fusion
+        if config.shared_expert_intermediate_size > 0 and (
+            not self.enable_shared_expert_fusion
+            or self.enable_stage_split_shared_expert_fusion
         ):
             self.shared_expert = Qwen2MoeMLP(
                 hidden_size=config.hidden_size,
@@ -332,9 +399,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self,
         topk_output: StandardTopKOutput,
         hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
     ) -> StandardTopKOutput:
         """Append shared expert ids and weights to topk output before fused MoE."""
-        if not self.enable_shared_expert_fusion:
+        if not (
+            self.enable_shared_expert_fusion
+            and _should_use_unifyinfer_qwen35_shared_expert_fusion(forward_batch)
+            and not _should_disable_unifyinfer_qwen35_shared_expert(forward_batch)
+        ):
             return topk_output
         shared_weights = self._get_shared_expert_weights(hidden_states)
         if shared_weights is None:
@@ -357,7 +429,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             router_logits=topk_output.router_logits,
         )
 
-    def _forward_shared_experts(self, hidden_states: torch.Tensor):
+    def _forward_shared_experts(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
+    ):
+        if _should_disable_unifyinfer_qwen35_shared_expert(forward_batch):
+            return None
         shared_output = None
         if self.shared_expert is not None:
             shared_output = self.shared_expert(hidden_states)
@@ -380,10 +458,18 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
     def _forward_deepep(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
         shared_output = None
+        use_fused_shared_expert = (
+            self.enable_shared_expert_fusion
+            and _should_use_unifyinfer_qwen35_shared_expert_fusion(forward_batch)
+            and not _should_disable_unifyinfer_qwen35_shared_expert(forward_batch)
+        )
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits, _ = self.gate(hidden_states)
-            shared_output = self._forward_shared_experts(hidden_states)
+            if not use_fused_shared_expert:
+                shared_output = self._forward_shared_experts(
+                    hidden_states, forward_batch
+                )
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
@@ -396,6 +482,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     else None
                 ),
             )
+            if use_fused_shared_expert and TopKOutputChecker.format_is_standard(
+                topk_output
+            ):
+                topk_output = self._append_shared_to_topk_output(
+                    topk_output, hidden_states, forward_batch
+                )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
         final_hidden_states = self.experts(
@@ -408,26 +500,104 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         return final_hidden_states
 
-    def _forward_router_experts(self, hidden_states: torch.Tensor):
+    def _forward_router_experts(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
+    ):
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
         if self.enable_shared_expert_fusion and TopKOutputChecker.format_is_standard(
             topk_output
         ):
-            topk_output = self._append_shared_to_topk_output(topk_output, hidden_states)
-        return self.experts(hidden_states, topk_output)
+            topk_output = self._append_shared_to_topk_output(
+                topk_output, hidden_states, forward_batch
+            )
+        with self._maybe_use_unifyinfer_decode_unfused_expert_view(forward_batch):
+            return self.experts(hidden_states, topk_output)
+
+    @contextmanager
+    def _maybe_use_unifyinfer_decode_unfused_expert_view(
+        self,
+        forward_batch: Optional[ForwardBatch],
+    ):
+        if not (
+            self.enable_stage_split_shared_expert_fusion
+            and _use_unifyinfer_qwen35_shared_expert_fusion_prefill_only_decode_unfused_view
+            and forward_batch is not None
+            and forward_batch.forward_mode.is_decode()
+        ):
+            yield
+            return
+
+        num_trim = self.num_fused_shared_experts
+        w13_weight = getattr(self.experts, "w13_weight", None)
+        w2_weight = getattr(self.experts, "w2_weight", None)
+        if (
+            num_trim <= 0
+            or not isinstance(w13_weight, torch.Tensor)
+            or not isinstance(w2_weight, torch.Tensor)
+            or w13_weight.shape[0] <= num_trim
+            or w2_weight.shape[0] <= num_trim
+        ):
+            yield
+            return
+
+        override_names: list[str] = []
+
+        def _set_override(name: str, value: object) -> None:
+            setattr(self.experts, name, value)
+            override_names.append(name)
+
+        def _maybe_set_sliced_tensor(name: str, tensor: object) -> None:
+            if isinstance(tensor, torch.Tensor) and tensor.shape[0] > num_trim:
+                _set_override(name, tensor[:-num_trim])
+
+        _maybe_set_sliced_tensor("unifyinfer_moe_w13_weight_override", w13_weight)
+        _maybe_set_sliced_tensor("unifyinfer_moe_w2_weight_override", w2_weight)
+        _maybe_set_sliced_tensor(
+            "unifyinfer_moe_w13_weight_bias_override",
+            getattr(self.experts, "w13_weight_bias", None),
+        )
+        _maybe_set_sliced_tensor(
+            "unifyinfer_moe_w2_weight_bias_override",
+            getattr(self.experts, "w2_weight_bias", None),
+        )
+        _maybe_set_sliced_tensor(
+            "unifyinfer_moe_w13_weight_prepacked_override",
+            getattr(self.experts, "unifyinfer_prepacked_w13_weight", None),
+        )
+        if not hasattr(self.experts, "unifyinfer_moe_w13_weight_prepacked_override"):
+            _maybe_set_sliced_tensor(
+                "unifyinfer_moe_w13_weight_prepacked_override",
+                getattr(self.experts, "unifyinfer_single_storage_w13_weight", None),
+            )
+        _set_override("unifyinfer_moe_num_experts_override", self.num_experts)
+        _set_override("unifyinfer_moe_num_local_experts_override", self.num_experts)
+
+        try:
+            yield
+        finally:
+            for name in reversed(override_names):
+                delattr(self.experts, name)
 
     def forward_normal_dual_stream(
         self,
         hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
-        shared_output = self._forward_shared_experts(hidden_states.clone())
+        shared_hidden_states = hidden_states
+        if not _should_disable_unifyinfer_qwen35_shared_expert(forward_batch):
+            shared_hidden_states = hidden_states.clone()
+        shared_output = self._forward_shared_experts(
+            shared_hidden_states, forward_batch
+        )
 
         with torch.cuda.stream(self.alt_stream):
-            router_output = self._forward_router_experts(hidden_states)
+            router_output = self._forward_router_experts(hidden_states, forward_batch)
 
         current_stream.wait_stream(self.alt_stream)
 
@@ -442,6 +612,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
+        disable_shared_expert = _should_disable_unifyinfer_qwen35_shared_expert(
+            forward_batch
+        )
+        use_fused_shared_expert = (
+            self.enable_shared_expert_fusion
+            and not disable_shared_expert
+            and _should_use_unifyinfer_qwen35_shared_expert_fusion(forward_batch)
+        )
 
         if get_moe_a2a_backend().is_deepep():
             return self._forward_deepep(hidden_states, forward_batch)
@@ -449,14 +627,28 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if (
             self.alt_stream is not None
             and hidden_states.shape[0] > 0
-            and get_is_capture_mode()
+            and not disable_shared_expert
+            and not use_fused_shared_expert
+            and (
+                get_is_capture_mode()
+                or _use_unifyinfer_qwen35_hip_alt_stream_shared_expert
+                or _should_use_unifyinfer_qwen35_hip_alt_stream_decode_only(
+                    forward_batch
+                )
+            )
         ):
             final_hidden_states, shared_output = self.forward_normal_dual_stream(
-                hidden_states
+                hidden_states, forward_batch
             )
         else:
-            shared_output = self._forward_shared_experts(hidden_states)
-            final_hidden_states = self._forward_router_experts(hidden_states)
+            shared_output = (
+                None
+                if use_fused_shared_expert
+                else self._forward_shared_experts(hidden_states, forward_batch)
+            )
+            final_hidden_states = self._forward_router_experts(
+                hidden_states, forward_batch
+            )
 
         if shared_output is not None:
             # In-place add is required to keep final_hidden_states in the

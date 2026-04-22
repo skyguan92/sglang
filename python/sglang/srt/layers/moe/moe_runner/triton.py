@@ -98,6 +98,7 @@ class TritonRunnerOutput(RunnerOutput):
 class TritonMoeQuantInfo(MoeQuantInfo):
     w13_weight: torch.Tensor
     w2_weight: torch.Tensor
+    w13_weight_prepacked: Optional[torch.Tensor] = None
     b13: Optional[torch.Tensor] = None
     b2: Optional[torch.Tensor] = None
     use_fp8_w8a8: bool = False
@@ -401,6 +402,7 @@ def fused_experts_none_to_triton(
         a1_scale=quant_info.a13_scale,
         a2_scale=quant_info.a2_scale,
         block_shape=quant_info.block_shape,
+        w1_prepacked=quant_info.w13_weight_prepacked,
     )
 
     return StandardCombineInput(

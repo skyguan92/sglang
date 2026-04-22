@@ -3571,8 +3571,10 @@ class ServerArgs:
             )
 
         if self.language_only and len(self.encoder_urls) == 0:
-            raise ValueError(
-                "requires at least one encoder urls to be set via --encoder-urls"
+            logger.warning(
+                "--language-only is set without --encoder-urls. "
+                "This local text-only path is allowed for pure-text serving, "
+                "but multimodal requests will not have a remote encoder."
             )
 
         # Validate IB devices when mooncake backend is used

@@ -26,6 +26,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.utils import MultiPlatformOp, copy_or_rebind_param
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -50,12 +51,24 @@ _is_hip = is_hip()
 _is_cpu = is_cpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_disable_aiter_fused_moe = (
+    get_bool_env_var("UNIFYINFER_DISABLE_AITER_FUSED_MOE") and _is_hip
+)
+_use_aiter_fused_moe = _use_aiter and not _disable_aiter_fused_moe
+_cache_unifyinfer_prepacked_w13 = (
+    get_bool_env_var("UNIFYINFER_EXPERIMENTAL_MOE_CACHE_PREPACKED_W13") and _is_hip
+)
+_single_storage_unifyinfer_w13 = (
+    get_bool_env_var("UNIFYINFER_EXPERIMENTAL_MOE_SINGLE_STORAGE_W13") and _is_hip
+)
 
 if _use_aiter:
+    from aiter.tuned_gemm import tgemm
+
+if _use_aiter_fused_moe:
     from aiter import ActivationType
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
-    from aiter.tuned_gemm import tgemm
 
 if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import npu_format_cast
@@ -173,6 +186,26 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         self.use_flashinfer_trtllm_moe = use_flashinfer_trtllm_moe
         self._cache_permute_indices = dict({})
 
+    def _should_use_unifyinfer_single_storage_w13(
+        self, params_dtype: torch.dtype
+    ) -> bool:
+        if not _single_storage_unifyinfer_w13:
+            return False
+        if params_dtype != torch.bfloat16:
+            return False
+        if (
+            self.use_triton_kernels
+            or self.use_flashinfer_trtllm_moe
+            or self.use_flashinfer_cutlass
+        ):
+            return False
+        try:
+            if get_global_server_args().cpu_offload_gb != 0:
+                return False
+        except Exception:
+            return False
+        return True
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -194,10 +227,34 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         w13_weight_n, w13_weight_k = (w13_up_dim, hidden_size)
         if self.use_triton_kernels:
             w13_weight_n, w13_weight_k = w13_weight_k, w13_weight_n
-        w13_weight = torch.nn.Parameter(
-            torch.empty(num_experts, w13_weight_n, w13_weight_k, dtype=params_dtype),
-            requires_grad=False,
-        )
+        if self._should_use_unifyinfer_single_storage_w13(params_dtype):
+            # Store one physical [E, K, N] tensor and expose the canonical
+            # [E, N, K] alias to the standard Triton path via strides.
+            w13_weight_storage = torch.empty(
+                num_experts,
+                hidden_size,
+                w13_up_dim,
+                dtype=params_dtype,
+            )
+            w13_weight_view = w13_weight_storage.as_strided(
+                size=(num_experts, w13_up_dim, hidden_size),
+                stride=(
+                    w13_weight_storage.stride(0),
+                    w13_weight_storage.stride(2),
+                    w13_weight_storage.stride(1),
+                ),
+            )
+            w13_weight = torch.nn.Parameter(
+                w13_weight_view,
+                requires_grad=False,
+            )
+            layer.unifyinfer_single_storage_w13_weight = w13_weight_storage
+        else:
+            w13_weight = torch.nn.Parameter(
+                torch.empty(num_experts, w13_weight_n, w13_weight_k, dtype=params_dtype),
+                requires_grad=False,
+            )
+            layer.unifyinfer_single_storage_w13_weight = None
         layer.register_parameter("w13_weight", w13_weight)
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
@@ -234,7 +291,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # Skip aiter weight shuffle when using non-auto MoE backend (e.g., triton, triton_kernels)
         # because aiter CK kernels don't support all GEMM dimensions
-        _should_use_aiter_moe = _use_aiter and get_moe_runner_backend().is_auto()
+        _should_use_aiter_moe = (
+            _use_aiter_fused_moe and get_moe_runner_backend().is_auto()
+        )
         if _should_use_aiter_moe:
             copy_or_rebind_param(
                 layer, "w13_weight", shuffle_weight(layer.w13_weight.data, (16, 16))
@@ -320,7 +379,51 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 weight.data = weight.data.transpose(1, 2)
                 weight.data = npu_format_cast(weight.data)
 
+        self._maybe_cache_unifyinfer_prepacked_w13(layer)
         return
+
+    def _maybe_cache_unifyinfer_prepacked_w13(self, layer: torch.nn.Module) -> None:
+        if not hasattr(layer, "unifyinfer_prepacked_w13_weight"):
+            layer.unifyinfer_prepacked_w13_weight = None
+        if not hasattr(layer, "unifyinfer_single_storage_w13_weight"):
+            layer.unifyinfer_single_storage_w13_weight = None
+
+        if layer.unifyinfer_single_storage_w13_weight is not None:
+            layer.unifyinfer_prepacked_w13_weight = (
+                layer.unifyinfer_single_storage_w13_weight
+            )
+            return
+
+        if not _cache_unifyinfer_prepacked_w13:
+            layer.unifyinfer_prepacked_w13_weight = None
+            return
+
+        # The standard Triton path keeps W13 in [E, N, K] for
+        # invoke_fused_moe_kernel(). The mixed-tail grouped reopen wants a
+        # second [E, K, N] view without paying request-time transpose cost.
+        if self.use_triton_kernels or self.use_flashinfer_trtllm_moe:
+            layer.unifyinfer_prepacked_w13_weight = None
+            return
+
+        w13_weight = getattr(layer, "w13_weight", None)
+        if w13_weight is None or w13_weight.ndim != 3:
+            layer.unifyinfer_prepacked_w13_weight = None
+            return
+        if w13_weight.dtype != torch.bfloat16:
+            layer.unifyinfer_prepacked_w13_weight = None
+            return
+
+        try:
+            layer.unifyinfer_prepacked_w13_weight = (
+                w13_weight.data.transpose(1, 2).contiguous()
+            )
+        except torch.OutOfMemoryError as exc:
+            layer.unifyinfer_prepacked_w13_weight = None
+            warn = getattr(logger, "warning_once", logger.warning)
+            warn(
+                "Skipping experimental MoE prepacked W13 cache due to OOM: %s",
+                exc,
+            )
 
     def maybe_restore_flashinfer_trtllm_bf16_weight_shape_for_load(
         self,
@@ -456,7 +559,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         else:
             # Skip aiter fused_moe when using non-auto MoE backend (e.g., triton, triton_kernels)
             # because aiter CK kernels don't support all GEMM dimensions
-            _should_use_aiter_moe = _use_aiter and get_moe_runner_backend().is_auto()
+            _should_use_aiter_moe = (
+                _use_aiter_fused_moe and get_moe_runner_backend().is_auto()
+            )
             if _should_use_aiter_moe:
                 assert not moe_runner_config.no_combine, "unsupported"
                 topk_weights, topk_ids, _ = topk_output
@@ -496,12 +601,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                         "falling back to Triton MoE runner."
                     )
 
-            quant_info = TritonMoeQuantInfo(
-                w13_weight=layer.w13_weight,
-                w2_weight=layer.w2_weight,
-                b13=getattr(layer, "w13_weight_bias", None),
-                b2=getattr(layer, "w2_weight_bias", None),
-            )
+            quant_info = self.get_triton_quant_info(layer)
             return self.runner.run(dispatch_output, quant_info)
 
     def forward_cpu(
@@ -555,11 +655,54 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             return StandardCombineInput(hidden_states=output)
 
     def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
+        w13_weight = getattr(
+            layer,
+            "unifyinfer_moe_w13_weight_override",
+            getattr(layer, "w13_weight"),
+        )
+        w2_weight = getattr(
+            layer,
+            "unifyinfer_moe_w2_weight_override",
+            getattr(layer, "w2_weight"),
+        )
+        w13_weight_prepacked = getattr(
+            layer, "unifyinfer_moe_w13_weight_prepacked_override", None
+        )
+        if w13_weight_prepacked is None:
+            w13_weight_prepacked = getattr(layer, "unifyinfer_prepacked_w13_weight", None)
+        if w13_weight_prepacked is None:
+            w13_weight_prepacked = getattr(
+                layer, "unifyinfer_single_storage_w13_weight", None
+            )
+        if w13_weight_prepacked is None:
+            if (
+                isinstance(w13_weight, torch.Tensor)
+                and w13_weight.ndim == 3
+                and w13_weight.dtype == torch.bfloat16
+                and not w13_weight.is_contiguous()
+            ):
+                w13_weight_prepacked = w13_weight.as_strided(
+                    size=(w13_weight.shape[0], w13_weight.shape[2], w13_weight.shape[1]),
+                    stride=(
+                        w13_weight.stride(0),
+                        w13_weight.stride(2),
+                        w13_weight.stride(1),
+                    ),
+                )
         return TritonMoeQuantInfo(
-            w13_weight=layer.w13_weight,
-            w2_weight=layer.w2_weight,
-            b13=getattr(layer, "w13_weight_bias", None),
-            b2=getattr(layer, "w2_weight_bias", None),
+            w13_weight=w13_weight,
+            w2_weight=w2_weight,
+            w13_weight_prepacked=w13_weight_prepacked,
+            b13=getattr(
+                layer,
+                "unifyinfer_moe_w13_weight_bias_override",
+                getattr(layer, "w13_weight_bias", None),
+            ),
+            b2=getattr(
+                layer,
+                "unifyinfer_moe_w2_weight_bias_override",
+                getattr(layer, "w2_weight_bias", None),
+            ),
         )
 
     def forward_xpu(

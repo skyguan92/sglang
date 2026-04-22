@@ -15,12 +15,14 @@
 """Inference-only Qwen3.5 model and Qwen3.5 MoE model compatible with HuggingFace weights."""
 
 import logging
+from contextlib import nullcontext
 from functools import lru_cache
 from typing import Iterable, Optional, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
 import triton
+from torch.autograd.profiler import record_function
 
 from sglang.jit_kernel.triton.gdn_fused_proj import (
     fused_qkvzba_split_reshape_cat_contiguous,
@@ -104,10 +106,76 @@ _is_cpu = is_cpu()
 _is_gfx95 = is_gfx95_supported()
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_unifyinfer_qwen35_hip_alt_stream = (
+    get_bool_env_var("UNIFYINFER_QWEN35_HIP_ALT_STREAM") and _is_hip
+)
+_use_unifyinfer_qwen35_hip_alt_stream_decode_only = (
+    get_bool_env_var("UNIFYINFER_QWEN35_HIP_ALT_STREAM_DECODE_ONLY") and _is_hip
+)
+_use_unifyinfer_qwen35_hip_alt_stream_shared_expert = (
+    _use_unifyinfer_qwen35_hip_alt_stream
+    or (
+        get_bool_env_var("UNIFYINFER_QWEN35_HIP_ALT_STREAM_SHARED_EXPERT")
+        and _is_hip
+    )
+)
+_use_unifyinfer_qwen35_hip_alt_stream_qk_norm = (
+    _use_unifyinfer_qwen35_hip_alt_stream
+    or (
+        get_bool_env_var("UNIFYINFER_QWEN35_HIP_ALT_STREAM_QK_NORM")
+        and _is_hip
+    )
+)
+_use_unifyinfer_qwen35_hip_alt_stream_qk_norm_decode_only = (
+    get_bool_env_var("UNIFYINFER_QWEN35_HIP_ALT_STREAM_QK_NORM_DECODE_ONLY")
+    and _is_hip
+)
+_use_unifyinfer_qwen35_hip_alt_stream_gdn_input_proj = (
+    _use_unifyinfer_qwen35_hip_alt_stream
+    or (
+        get_bool_env_var("UNIFYINFER_QWEN35_HIP_ALT_STREAM_GDN_INPUT_PROJ")
+        and _is_hip
+    )
+)
+_use_unifyinfer_qwen35_hip_alt_stream_gdn_input_proj_decode_only = (
+    get_bool_env_var("UNIFYINFER_QWEN35_HIP_ALT_STREAM_GDN_INPUT_PROJ_DECODE_ONLY")
+    and _is_hip
+)
+_use_unifyinfer_qwen35_shared_expert_fusion = (
+    get_bool_env_var("UNIFYINFER_QWEN35_SHARED_EXPERT_FUSION") and _is_hip
+)
+_use_unifyinfer_qwen35_shared_expert_fusion_prefill_only = (
+    get_bool_env_var("UNIFYINFER_QWEN35_SHARED_EXPERT_FUSION_PREFILL_ONLY")
+    and _is_hip
+)
+_use_unifyinfer_qwen35_gdn_fused_proj = not get_bool_env_var(
+    "UNIFYINFER_DISABLE_QWEN35_GDN_FUSED_PROJ"
+)
+_use_unifyinfer_qwen35_trace_attn_split = get_bool_env_var(
+    "UNIFYINFER_QWEN35_TRACE_ATTN_SPLIT"
+)
 _is_amx_available = cpu_has_amx_support()
 
 
 cached_get_processor = lru_cache(get_processor)
+
+
+def _should_use_unifyinfer_qwen35_hip_alt_stream_component(
+    enabled: bool,
+    decode_only: bool,
+    forward_batch: Optional[ForwardBatch],
+) -> bool:
+    if not enabled:
+        return False
+    if not decode_only:
+        return True
+    return forward_batch is not None and forward_batch.forward_mode.is_decode()
+
+
+def _qwen35_trace_span(name: str):
+    if not _use_unifyinfer_qwen35_trace_attn_split:
+        return nullcontext()
+    return record_function(name)
 
 
 class Qwen3_5GatedDeltaNet(nn.Module):
@@ -398,7 +466,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         return query, key, value, z, b, a
 
-    def _forward_input_proj(self, hidden_states: torch.Tensor):
+    def _forward_input_proj(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
         if (
             _is_cpu
             or _is_npu
@@ -411,7 +483,17 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         seq_len, _ = hidden_states.shape
         if (
             self.alt_stream is not None
-            and get_is_capture_mode()
+            and (
+                get_is_capture_mode()
+                or _should_use_unifyinfer_qwen35_hip_alt_stream_component(
+                    _use_unifyinfer_qwen35_hip_alt_stream_gdn_input_proj,
+                    (
+                        _use_unifyinfer_qwen35_hip_alt_stream_gdn_input_proj_decode_only
+                        or _use_unifyinfer_qwen35_hip_alt_stream_decode_only
+                    ),
+                    forward_batch,
+                )
+            )
             and seq_len < DUAL_STREAM_TOKEN_THRESHOLD
         ):
             current_stream = torch.cuda.current_stream()
@@ -454,62 +536,74 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         2. Core attention (custom op)
         3. Output projection
         """
-        projected_states_qkvz, projected_states_ba = self._forward_input_proj(
-            hidden_states
-        )
-        self._refresh_attn_conv_weights()
-
-        if self.num_v_heads // self.num_k_heads in [1, 2, 4] and not _is_cpu:
-            mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
-                projected_states_qkvz,
-                projected_states_ba,
-                triton.cdiv(self.num_k_heads, self.attn_tp_size),
-                triton.cdiv(self.num_v_heads, self.attn_tp_size),
-                self.head_k_dim,
-                self.head_v_dim,
+        with _qwen35_trace_span("_qwen35_gdnsplit_inproj"):
+            projected_states_qkvz, projected_states_ba = self._forward_input_proj(
+                hidden_states,
+                forward_batch,
             )
-        elif _is_cpu and _is_amx_available:
-            mixed_qkv, z, b, a = (
-                torch.ops.sgl_kernel.fused_qkvzba_split_reshape_cat_cpu(
+
+        with _qwen35_trace_span("_qwen35_gdnsplit_repack"):
+            self._refresh_attn_conv_weights()
+
+            if (
+                _use_unifyinfer_qwen35_gdn_fused_proj
+                and self.num_v_heads // self.num_k_heads in [1, 2, 4]
+                and not _is_cpu
+            ):
+                mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
                     projected_states_qkvz,
                     projected_states_ba,
-                    self.num_k_heads // self.attn_tp_size,
-                    self.num_v_heads // self.attn_tp_size,
+                    triton.cdiv(self.num_k_heads, self.attn_tp_size),
+                    triton.cdiv(self.num_v_heads, self.attn_tp_size),
                     self.head_k_dim,
                     self.head_v_dim,
                 )
+            elif _is_cpu and _is_amx_available:
+                mixed_qkv, z, b, a = (
+                    torch.ops.sgl_kernel.fused_qkvzba_split_reshape_cat_cpu(
+                        projected_states_qkvz,
+                        projected_states_ba,
+                        self.num_k_heads // self.attn_tp_size,
+                        self.num_v_heads // self.attn_tp_size,
+                        self.head_k_dim,
+                        self.head_v_dim,
+                    )
+                )
+            else:
+                query, key, value, z, b, a = self.fix_query_key_value_ordering(
+                    projected_states_qkvz, projected_states_ba
+                )
+                query, key, value = map(
+                    lambda x: x.reshape(x.shape[0], -1), (query, key, value)
+                )
+                mixed_qkv = torch.cat((query, key, value), dim=-1)
+
+        with _qwen35_trace_span("_qwen35_gdnsplit_core"):
+            core_attn_out = self.attn(
+                forward_batch,
+                mixed_qkv=mixed_qkv,
+                a=a,
+                b=b,
             )
-        else:
-            query, key, value, z, b, a = self.fix_query_key_value_ordering(
-                projected_states_qkvz, projected_states_ba
-            )
-            query, key, value = map(
-                lambda x: x.reshape(x.shape[0], -1), (query, key, value)
-            )
-            mixed_qkv = torch.cat((query, key, value), dim=-1)
-        core_attn_out = self.attn(
-            forward_batch,
-            mixed_qkv=mixed_qkv,
-            a=a,
-            b=b,
-        )
 
-        z_shape_og = z.shape
-        # reshape input data into 2D tensor
-        core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
-        z = z.reshape(-1, z.shape[-1])
+        with _qwen35_trace_span("_qwen35_gdnsplit_postnorm"):
+            z_shape_og = z.shape
+            # reshape input data into 2D tensor
+            core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
+            z = z.reshape(-1, z.shape[-1])
 
-        # Add padding for DP-Attn
-        if core_attn_out.shape != z.shape:
-            core_attn_out_pad = torch.zeros_like(z)
-            core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
-            core_attn_out = core_attn_out_pad
+            # Add padding for DP-Attn
+            if core_attn_out.shape != z.shape:
+                core_attn_out_pad = torch.zeros_like(z)
+                core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
+                core_attn_out = core_attn_out_pad
 
-        core_attn_out = self.norm(core_attn_out, z)
-        core_attn_out = core_attn_out.reshape(z_shape_og)
-        core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
+            core_attn_out = self.norm(core_attn_out, z)
+            core_attn_out = core_attn_out.reshape(z_shape_og)
+            core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
 
-        output, _ = self.out_proj(core_attn_out)
+        with _qwen35_trace_span("_qwen35_gdnsplit_outproj"):
+            output, _ = self.out_proj(core_attn_out)
         return output
 
 
@@ -795,10 +889,23 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self.alt_stream = alt_stream
 
     def _apply_qk_norm(
-        self, q: torch.Tensor, k: torch.Tensor
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        forward_batch: ForwardBatch,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Apply Q/K normalization with optional alt_stream overlap."""
-        if self.alt_stream is not None and get_is_capture_mode():
+        if self.alt_stream is not None and (
+            get_is_capture_mode()
+            or _should_use_unifyinfer_qwen35_hip_alt_stream_component(
+                _use_unifyinfer_qwen35_hip_alt_stream_qk_norm,
+                (
+                    _use_unifyinfer_qwen35_hip_alt_stream_qk_norm_decode_only
+                    or _use_unifyinfer_qwen35_hip_alt_stream_decode_only
+                ),
+                forward_batch,
+            )
+        ):
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
             q_by_head = q.reshape(-1, self.head_dim)
@@ -823,29 +930,37 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """Full attention forward pass."""
-        qkv, _ = self.qkv_proj(hidden_states)
+        with _qwen35_trace_span("_qwen35_attnsplit_proj"):
+            qkv, _ = self.qkv_proj(hidden_states)
 
         if self.attn_output_gate:
-            q_gate, k, v = qkv.split(
-                [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
-            )
-            orig_shape = q_gate.shape[:-1]
-            q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
-            q, gate = torch.chunk(q_gate, 2, dim=-1)
-            q = q.reshape(*orig_shape, -1)
-            gate = gate.reshape(*orig_shape, -1)
+            with _qwen35_trace_span("_qwen35_attnsplit_split"):
+                q_gate, k, v = qkv.split(
+                    [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
+                )
+                orig_shape = q_gate.shape[:-1]
+                q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
+                q, gate = torch.chunk(q_gate, 2, dim=-1)
+                q = q.reshape(*orig_shape, -1)
+                gate = gate.reshape(*orig_shape, -1)
         else:
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            with _qwen35_trace_span("_qwen35_attnsplit_split"):
+                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        q, k = self._apply_qk_norm(q, k)
-        q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, forward_batch)
+        with _qwen35_trace_span("_qwen35_attnsplit_qknorm"):
+            q, k = self._apply_qk_norm(q, k, forward_batch)
+        with _qwen35_trace_span("_qwen35_attnsplit_rotary"):
+            q, k = self.rotary_emb(positions, q, k)
+        with _qwen35_trace_span("_qwen35_attnsplit_core"):
+            attn_output = self.attn(q, k, v, forward_batch)
 
         if self.attn_output_gate:
-            gate = torch.sigmoid(gate)
-            attn_output = attn_output * gate
+            with _qwen35_trace_span("_qwen35_attnsplit_gateapply"):
+                gate = torch.sigmoid(gate)
+                attn_output = attn_output * gate
 
-        output, _ = self.o_proj(attn_output)
+        with _qwen35_trace_span("_qwen35_attnsplit_outproj"):
+            output, _ = self.o_proj(attn_output)
         return output
 
     def forward(
@@ -936,7 +1051,13 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.hidden_size = config.hidden_size
         self.pp_group = get_pp_group()
 
-        alt_stream = torch.cuda.Stream() if _is_cuda else None
+        alt_stream = torch.cuda.Stream() if (
+            _is_cuda
+            or _use_unifyinfer_qwen35_hip_alt_stream_decode_only
+            or _use_unifyinfer_qwen35_hip_alt_stream_shared_expert
+            or _use_unifyinfer_qwen35_hip_alt_stream_qk_norm
+            or _use_unifyinfer_qwen35_hip_alt_stream_gdn_input_proj
+        ) else None
 
         # Embedding layer
         if self.pp_group.is_first_rank:
@@ -1228,6 +1349,38 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                 )
             return True
 
+        def load_explicit_shared_expert_duplicate(
+            name: str,
+            loaded_weight: torch.Tensor,
+        ) -> None:
+            if not (
+                self.enable_shared_expert_fusion
+                and _use_unifyinfer_qwen35_shared_expert_fusion_prefill_only
+                and "mlp.shared_expert." in name
+            ):
+                return
+
+            if name in params_dict:
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                loaded_params.add(name)
+                return
+
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name or "mlp.experts" in name:
+                    continue
+                explicit_name = name.replace(weight_name, param_name)
+                if explicit_name.endswith(ignore_suffixes) and explicit_name not in params_dict:
+                    return
+                if explicit_name not in params_dict:
+                    continue
+                param = params_dict[explicit_name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight, shard_id)
+                loaded_params.add(explicit_name)
+                return
+
         loaded_params: Set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
 
@@ -1379,7 +1532,11 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         )
         self.is_mrope_enabled = "mrope_section" in rope_config
 
-        self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
+        self.deepstack_visual_indexes = getattr(
+            self.visual,
+            "deepstack_visual_indexes",
+            config.vision_config.deepstack_visual_indexes,
+        )
 
     @property
     def start_layer(self) -> int:
@@ -1515,9 +1672,13 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         )
         self.is_mrope_enabled = "mrope_section" in rope_config
 
-        self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
+        self.deepstack_visual_indexes = getattr(
+            self.visual,
+            "deepstack_visual_indexes",
+            config.vision_config.deepstack_visual_indexes,
+        )
         self.num_fused_shared_experts = 0
-        if _use_aiter:
+        if _use_aiter or _use_unifyinfer_qwen35_shared_expert_fusion:
             self.num_fused_shared_experts = self._get_num_fused_shared_experts()
 
         self.enable_shared_expert_fusion = self.num_fused_shared_experts > 0
@@ -1652,6 +1813,41 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 )
             return True
 
+        def load_explicit_shared_expert_duplicate(
+            name: str,
+            loaded_weight: torch.Tensor,
+        ) -> None:
+            if not (
+                self.enable_shared_expert_fusion
+                and _use_unifyinfer_qwen35_shared_expert_fusion_prefill_only
+                and "mlp.shared_expert." in name
+            ):
+                return
+
+            if name in params_dict:
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                loaded_params.add(name)
+                return
+
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name or "mlp.experts" in name:
+                    continue
+                explicit_name = name.replace(weight_name, param_name)
+                if (
+                    explicit_name.endswith(ignore_suffixes)
+                    and explicit_name not in params_dict
+                ):
+                    return
+                if explicit_name not in params_dict:
+                    continue
+                param = params_dict[explicit_name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight, shard_id)
+                loaded_params.add(explicit_name)
+                return
+
         loaded_params: Set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
 
@@ -1684,6 +1880,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             ):
                 continue
 
+            load_explicit_shared_expert_duplicate(name, loaded_weight)
             if self.enable_shared_expert_fusion:
                 if "mlp.shared_expert." in name:
                     # Firstly map mlp.shared_expert.xx_proj to mlp.experts.512.xx_proj

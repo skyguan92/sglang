@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import torch.nn.functional as F
+import triton
 import triton.language as tl
 
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
@@ -43,8 +44,18 @@ _is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_disable_aiter_moe_sum = (
+    get_bool_env_var("UNIFYINFER_DISABLE_AITER_MOE_SUM") and _is_hip
+)
+_use_aiter_moe_sum = _use_aiter and not _disable_aiter_moe_sum
 _is_xpu = is_xpu()
 _use_sgl_xpu = use_intel_xpu_backend()
+_use_unifyinfer_hip_mmq_port = (
+    get_bool_env_var("UNIFYINFER_FUSED_MOE_HIP_MMQ_PORT") and _is_hip
+)
+_use_unifyinfer_mixed_tail_w13 = (
+    get_bool_env_var("UNIFYINFER_EXPERIMENTAL_MOE_MIXED_TAIL_W13") and _is_hip
+)
 
 
 if _is_cuda:
@@ -54,7 +65,7 @@ elif _is_cpu and _is_cpu_amx_available:
 elif _is_hip:
     from sgl_kernel import gelu_and_mul, silu_and_mul
 
-    if _use_aiter:
+    if _use_aiter_moe_sum:
         try:
             from aiter import moe_sum
         except ImportError:
@@ -106,6 +117,7 @@ def inplace_fused_experts(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
+    w1_prepacked: Optional[torch.Tensor] = None,
 ) -> None:
     fused_experts_impl(
         hidden_states,
@@ -136,6 +148,7 @@ def inplace_fused_experts(
         gemm1_alpha,
         gemm1_limit,
         filter_expert,
+        w1_prepacked,
     )
 
 
@@ -168,6 +181,7 @@ def outplace_fused_experts(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
+    w1_prepacked: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     return fused_experts_impl(
         hidden_states,
@@ -198,6 +212,7 @@ def outplace_fused_experts(
         gemm1_alpha=gemm1_alpha,
         gemm1_limit=gemm1_limit,
         filter_expert=filter_expert,
+        w1_prepacked=w1_prepacked,
     )
 
 
@@ -221,14 +236,63 @@ def fused_experts(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
+    w1_prepacked: Optional[torch.Tensor] = None,
 ):
     topk_weights, topk_ids, _ = topk_output
     filter_expert = (
         moe_runner_config.num_experts is None
         or moe_runner_config.num_experts != moe_runner_config.num_local_experts
     )
+    use_unifyinfer_mixed_tail_w13 = _should_use_unifyinfer_mixed_tail_w13(
+        hidden_states=hidden_states,
+        w1=w1,
+        w1_prepacked=w1_prepacked,
+        b1=b1,
+        use_fp8_w8a8=use_fp8_w8a8,
+        use_int8_w8a8=use_int8_w8a8,
+        use_int8_w8a16=use_int8_w8a16,
+        use_int4_w4a16=use_int4_w4a16,
+        per_channel_quant=per_channel_quant,
+        w1_scale=w1_scale,
+        w1_zp=w1_zp,
+        a1_scale=a1_scale,
+        block_shape=block_shape,
+    )
     if moe_runner_config.inplace:
         assert not moe_runner_config.no_combine, "no combine + inplace makes no sense"
+        if use_unifyinfer_mixed_tail_w13:
+            fused_experts_impl(
+                hidden_states,
+                w1,
+                w2,
+                topk_weights,
+                topk_ids,
+                b1,
+                b2,
+                True,
+                moe_runner_config.activation,
+                moe_runner_config.is_gated,
+                moe_runner_config.apply_router_weight_on_input,
+                use_fp8_w8a8,
+                use_int8_w8a8,
+                use_int8_w8a16,
+                use_int4_w4a16,
+                per_channel_quant,
+                w1_scale,
+                w2_scale,
+                w1_zp,
+                w2_zp,
+                a1_scale,
+                a2_scale,
+                block_shape,
+                False,
+                moe_runner_config.routed_scaling_factor,
+                moe_runner_config.gemm1_alpha,
+                moe_runner_config.gemm1_clamp_limit,
+                filter_expert,
+                w1_prepacked=w1_prepacked,
+            )
+            return hidden_states
         inplace_fused_experts(
             hidden_states,
             w1,
@@ -256,9 +320,42 @@ def fused_experts(
             moe_runner_config.gemm1_alpha,
             moe_runner_config.gemm1_clamp_limit,
             filter_expert,
+            w1_prepacked,
         )
         return hidden_states
     else:
+        if use_unifyinfer_mixed_tail_w13:
+            return fused_experts_impl(
+                hidden_states,
+                w1,
+                w2,
+                topk_weights,
+                topk_ids,
+                b1,
+                b2,
+                False,
+                moe_runner_config.activation,
+                moe_runner_config.is_gated,
+                moe_runner_config.apply_router_weight_on_input,
+                use_fp8_w8a8,
+                use_int8_w8a8,
+                use_int8_w8a16,
+                use_int4_w4a16,
+                per_channel_quant,
+                w1_scale,
+                w2_scale,
+                w1_zp,
+                w2_zp,
+                a1_scale,
+                a2_scale,
+                block_shape,
+                moe_runner_config.no_combine,
+                moe_runner_config.routed_scaling_factor,
+                moe_runner_config.gemm1_alpha,
+                moe_runner_config.gemm1_clamp_limit,
+                filter_expert,
+                w1_prepacked=w1_prepacked,
+            )
         return outplace_fused_experts(
             hidden_states,
             w1,
@@ -287,6 +384,7 @@ def fused_experts(
             gemm1_alpha=moe_runner_config.gemm1_alpha,
             gemm1_limit=moe_runner_config.gemm1_clamp_limit,
             filter_expert=filter_expert,
+            w1_prepacked=w1_prepacked,
         )
 
 
@@ -320,6 +418,329 @@ def _down_moe_use_tma():
     return support_tensor_descriptor()
 
 
+@triton.jit
+def _grouped_tail_direct_weight_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    starts_ptr,
+    offs_ptr,
+    expert_ids_ptr,
+    total_groups,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_be,
+    stride_bn,
+    stride_bk,
+    stride_cm,
+    stride_cn,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    pid_group = pid // num_pid_n
+    pid_n = pid % num_pid_n
+
+    if pid_group >= total_groups:
+        return
+
+    start = tl.load(starts_ptr + pid_group).to(tl.int32)
+    end = tl.load(offs_ptr + pid_group).to(tl.int32)
+    group_rows = end - start
+    if group_rows <= 0:
+        return
+
+    expert_id = tl.load(expert_ids_ptr + pid_group).to(tl.int64)
+    offs_m = tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    for k_start in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        offs_k = k_start * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+        a = tl.load(
+            a_ptr + (start + offs_m)[:, None] * stride_am + offs_k[None, :] * stride_ak,
+            mask=(offs_m[:, None] < group_rows) & (offs_k[None, :] < K),
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptr
+            + expert_id * stride_be
+            + offs_n[None, :] * stride_bn
+            + offs_k[:, None] * stride_bk,
+            mask=(offs_n[None, :] < N) & (offs_k[:, None] < K),
+            other=0.0,
+        )
+        acc += tl.dot(a, b)
+
+    tl.store(
+        c_ptr + (start + offs_m)[:, None] * stride_cm + offs_n[None, :] * stride_cn,
+        acc,
+        mask=(offs_m[:, None] < group_rows) & (offs_n[None, :] < N),
+    )
+
+
+def _should_use_unifyinfer_mixed_tail_w13(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w1_prepacked: Optional[torch.Tensor],
+    b1: Optional[torch.Tensor],
+    use_fp8_w8a8: bool,
+    use_int8_w8a8: bool,
+    use_int8_w8a16: bool,
+    use_int4_w4a16: bool,
+    per_channel_quant: bool,
+    w1_scale: Optional[torch.Tensor],
+    w1_zp: Optional[torch.Tensor],
+    a1_scale: Optional[torch.Tensor],
+    block_shape: Optional[List[int]],
+) -> bool:
+    return (
+        _use_unifyinfer_mixed_tail_w13
+        and w1_prepacked is not None
+        and b1 is None
+        and hidden_states.dtype == torch.bfloat16
+        and w1.dtype == torch.bfloat16
+        and w1_prepacked.dtype == torch.bfloat16
+        and not use_fp8_w8a8
+        and not use_int8_w8a8
+        and not use_int8_w8a16
+        and not use_int4_w4a16
+        and not per_channel_quant
+        and w1_scale is None
+        and w1_zp is None
+        and a1_scale is None
+        and block_shape is None
+        and w1_prepacked.shape
+        == (w1.shape[0], w1.shape[2], w1.shape[1])
+    )
+
+
+def _is_unifyinfer_single_storage_w13_alias(
+    w1: torch.Tensor,
+    w1_prepacked: Optional[torch.Tensor],
+) -> bool:
+    return (
+        w1_prepacked is not None
+        and not w1.is_contiguous()
+        and w1_prepacked.is_contiguous()
+        and w1.dtype == torch.bfloat16
+        and w1_prepacked.dtype == torch.bfloat16
+        and w1.data_ptr() == w1_prepacked.data_ptr()
+        and w1.shape == (w1_prepacked.shape[0], w1_prepacked.shape[2], w1_prepacked.shape[1])
+        and w1.stride(0) == w1_prepacked.stride(0)
+        and w1.stride(1) == w1_prepacked.stride(2)
+        and w1.stride(2) == w1_prepacked.stride(1)
+    )
+
+
+def _build_unifyinfer_mixed_tail_metadata(
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    block_size_m: int,
+    num_valid_assignments: int,
+) -> dict[str, torch.Tensor]:
+    device = sorted_token_ids.device
+    num_tokens_post_padded_value = int(num_tokens_post_padded.item())
+    if num_tokens_post_padded_value <= 0:
+        empty_i32 = torch.empty((0,), dtype=torch.int32, device=device)
+        return {
+            "full_sorted_token_ids": empty_i32,
+            "full_expert_ids": empty_i32,
+            "full_num_tokens_post_padded": torch.zeros(
+                (1,), dtype=torch.int32, device=device
+            ),
+            "tail_assignment_ids": empty_i32,
+            "tail_starts": empty_i32,
+            "tail_ends": empty_i32,
+            "tail_expert_ids": empty_i32,
+            "zero_tail_assignment_ids": empty_i32,
+        }
+
+    num_blocks = triton.cdiv(num_tokens_post_padded_value, block_size_m)
+    sorted_blocks = sorted_token_ids[: num_blocks * block_size_m].view(
+        num_blocks, block_size_m
+    )
+    expert_blocks = expert_ids[:num_blocks]
+    valid_mask = sorted_blocks < num_valid_assignments
+    valid_counts = valid_mask.sum(dim=1)
+
+    full_block_mask = valid_counts == block_size_m
+    tail_block_mask = (
+        (valid_counts > 0) & (valid_counts < block_size_m) & (expert_blocks != -1)
+    )
+    zero_tail_block_mask = (
+        (valid_counts > 0) & (valid_counts < block_size_m) & (expert_blocks == -1)
+    )
+
+    full_sorted_token_ids = sorted_blocks[full_block_mask].reshape(-1).contiguous()
+    full_expert_ids = expert_blocks[full_block_mask].contiguous()
+    full_num_tokens_post_padded = torch.tensor(
+        [full_sorted_token_ids.numel()],
+        dtype=torch.int32,
+        device=device,
+    )
+
+    tail_assignment_ids = sorted_blocks[tail_block_mask][
+        valid_mask[tail_block_mask]
+    ].contiguous()
+    tail_expert_ids = expert_blocks[tail_block_mask].contiguous()
+    tail_counts = valid_counts[tail_block_mask].to(dtype=torch.int32)
+    if tail_counts.numel() > 0:
+        tail_ends = tail_counts.cumsum(dim=0)
+        tail_starts = torch.cat(
+            [
+                torch.zeros((1,), dtype=torch.int32, device=device),
+                tail_ends[:-1],
+            ]
+        )
+    else:
+        tail_starts = torch.empty((0,), dtype=torch.int32, device=device)
+        tail_ends = torch.empty((0,), dtype=torch.int32, device=device)
+
+    zero_tail_assignment_ids = sorted_blocks[zero_tail_block_mask][
+        valid_mask[zero_tail_block_mask]
+    ].contiguous()
+
+    return {
+        "full_sorted_token_ids": full_sorted_token_ids,
+        "full_expert_ids": full_expert_ids,
+        "full_num_tokens_post_padded": full_num_tokens_post_padded,
+        "tail_assignment_ids": tail_assignment_ids,
+        "tail_starts": tail_starts,
+        "tail_ends": tail_ends,
+        "tail_expert_ids": tail_expert_ids,
+        "zero_tail_assignment_ids": zero_tail_assignment_ids,
+    }
+
+
+def _invoke_unifyinfer_mixed_tail_w13(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w1_prepacked: torch.Tensor,
+    intermediate_cache1: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    mul_routed_weight: bool,
+    top_k: int,
+    config: dict,
+    compute_type: tl.dtype,
+    filter_expert: bool,
+) -> None:
+    block_size_m = int(config["BLOCK_SIZE_M"])
+    metadata = _build_unifyinfer_mixed_tail_metadata(
+        sorted_token_ids=sorted_token_ids,
+        expert_ids=expert_ids,
+        num_tokens_post_padded=num_tokens_post_padded,
+        block_size_m=block_size_m,
+        num_valid_assignments=topk_ids.numel(),
+    )
+
+    full_num_tokens_post_padded = metadata["full_num_tokens_post_padded"]
+    if int(full_num_tokens_post_padded.item()) > 0:
+        invoke_fused_moe_kernel(
+            hidden_states,
+            w1,
+            None,
+            intermediate_cache1,
+            None,
+            None,
+            None,
+            topk_weights,
+            topk_ids,
+            metadata["full_sorted_token_ids"],
+            metadata["full_expert_ids"],
+            full_num_tokens_post_padded,
+            mul_routed_weight,
+            top_k,
+            config,
+            compute_type=compute_type,
+            use_fp8_w8a8=False,
+            use_int8_w8a8=False,
+            use_int8_w8a16=False,
+            use_int4_w4a16=False,
+            per_channel_quant=False,
+            block_shape=None,
+            filter_expert=filter_expert,
+        )
+
+    zero_tail_assignment_ids = metadata["zero_tail_assignment_ids"]
+    if zero_tail_assignment_ids.numel() > 0:
+        zero_tail_assignment_ids = zero_tail_assignment_ids.to(dtype=torch.long)
+        intermediate_cache1.index_copy_(
+            0,
+            zero_tail_assignment_ids,
+            torch.zeros(
+                (zero_tail_assignment_ids.numel(), intermediate_cache1.shape[1]),
+                device=intermediate_cache1.device,
+                dtype=intermediate_cache1.dtype,
+            ),
+        )
+
+    tail_assignment_ids = metadata["tail_assignment_ids"]
+    if tail_assignment_ids.numel() == 0:
+        return
+
+    tail_assignment_ids_long = tail_assignment_ids.to(dtype=torch.long)
+    tail_token_ids = torch.div(
+        tail_assignment_ids_long, top_k, rounding_mode="floor"
+    ).contiguous()
+    tail_hidden_states = hidden_states.index_select(0, tail_token_ids).contiguous()
+    if mul_routed_weight:
+        tail_router_weights = topk_weights.reshape(-1).index_select(
+            0, tail_assignment_ids_long
+        )
+        tail_hidden_states.mul_(tail_router_weights.to(tail_hidden_states.dtype).unsqueeze(1))
+
+    tail_out = torch.empty(
+        (tail_assignment_ids_long.numel(), w1.shape[1]),
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    )
+
+    block_size_n = max(int(config["BLOCK_SIZE_N"]), 64)
+    block_size_k = 64
+    if hidden_states.shape[1] % block_size_k != 0:
+        raise ValueError("mixed-tail grouped kernel requires K to be divisible by 64")
+
+    _grouped_tail_direct_weight_kernel[
+        lambda meta: (
+            metadata["tail_expert_ids"].numel()
+            * triton.cdiv(w1.shape[1], meta["BLOCK_SIZE_N"]),
+        )
+    ](
+        tail_hidden_states,
+        w1_prepacked,
+        tail_out,
+        metadata["tail_starts"],
+        metadata["tail_ends"],
+        metadata["tail_expert_ids"],
+        metadata["tail_expert_ids"].numel(),
+        w1.shape[1],
+        hidden_states.shape[1],
+        tail_hidden_states.stride(0),
+        tail_hidden_states.stride(1),
+        w1_prepacked.stride(0),
+        w1_prepacked.stride(2),
+        w1_prepacked.stride(1),
+        tail_out.stride(0),
+        tail_out.stride(1),
+        BLOCK_SIZE_M=block_size_m,
+        BLOCK_SIZE_N=block_size_n,
+        BLOCK_SIZE_K=block_size_k,
+        num_warps=4,
+        num_stages=2,
+    )
+    intermediate_cache1.index_copy_(0, tail_assignment_ids_long, tail_out)
+
+
 def fused_experts_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -349,6 +770,7 @@ def fused_experts_impl(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     filter_expert: bool = True,
+    w1_prepacked: Optional[torch.Tensor] = None,
 ):
     padded_size = padding_size
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
@@ -363,7 +785,10 @@ def fused_experts_impl(
         ), f"Hidden size mismatch"
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
-    assert w1.is_contiguous(), "Expert weights1 must be contiguous"
+    alias_ok = _is_unifyinfer_single_storage_w13_alias(w1, w1_prepacked)
+    assert (
+        w1.is_contiguous() or alias_ok
+    ), "Expert weights1 must be contiguous or a supported single-storage W13 alias"
     assert w2.is_contiguous(), "Expert weights2 must be contiguous"
     assert hidden_states.dtype in [torch.float32, torch.float16, torch.bfloat16]
 
@@ -480,32 +905,64 @@ def fused_experts_impl(
             curr_topk_ids, config["BLOCK_SIZE_M"], E
         )
 
-        invoke_fused_moe_kernel(
-            curr_hidden_states,
-            w1,
-            b1,
-            intermediate_cache1,
-            a1_scale,
-            w1_scale,
-            w1_zp,
-            curr_topk_weights,
-            curr_topk_ids,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            apply_router_weight_on_input,
-            topk_ids.shape[1],
-            config,
-            compute_type=compute_type,
+        if _should_use_unifyinfer_mixed_tail_w13(
+            hidden_states=curr_hidden_states,
+            w1=w1,
+            w1_prepacked=w1_prepacked,
+            b1=b1,
             use_fp8_w8a8=use_fp8_w8a8,
             use_int8_w8a8=use_int8_w8a8,
             use_int8_w8a16=use_int8_w8a16,
             use_int4_w4a16=use_int4_w4a16,
             per_channel_quant=per_channel_quant,
+            w1_scale=w1_scale,
+            w1_zp=w1_zp,
+            a1_scale=a1_scale,
             block_shape=block_shape,
-            c_sorted=down_moe_use_tma,
-            filter_expert=filter_expert,
-        )
+        ):
+            _invoke_unifyinfer_mixed_tail_w13(
+                hidden_states=curr_hidden_states,
+                w1=w1,
+                w1_prepacked=w1_prepacked,
+                intermediate_cache1=intermediate_cache1,
+                topk_weights=curr_topk_weights,
+                topk_ids=curr_topk_ids,
+                sorted_token_ids=sorted_token_ids,
+                expert_ids=expert_ids,
+                num_tokens_post_padded=num_tokens_post_padded,
+                mul_routed_weight=apply_router_weight_on_input,
+                top_k=topk_ids.shape[1],
+                config=config,
+                compute_type=compute_type,
+                filter_expert=filter_expert,
+            )
+        else:
+            invoke_fused_moe_kernel(
+                curr_hidden_states,
+                w1,
+                b1,
+                intermediate_cache1,
+                a1_scale,
+                w1_scale,
+                w1_zp,
+                curr_topk_weights,
+                curr_topk_ids,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                apply_router_weight_on_input,
+                topk_ids.shape[1],
+                config,
+                compute_type=compute_type,
+                use_fp8_w8a8=use_fp8_w8a8,
+                use_int8_w8a8=use_int8_w8a8,
+                use_int8_w8a16=use_int8_w8a16,
+                use_int4_w4a16=use_int4_w4a16,
+                per_channel_quant=per_channel_quant,
+                block_shape=block_shape,
+                c_sorted=down_moe_use_tma,
+                filter_expert=filter_expert,
+            )
 
         # Activation function with multiplication
         if activation == "silu" and is_gated:
@@ -521,7 +978,8 @@ def fused_experts_impl(
                     intermediate_cache1.view(-1, N), gemm1_limit
                 )
             elif _is_cuda or _is_hip or _is_xpu:
-                if not filter_expert:
+                use_triton_activation = filter_expert or _use_unifyinfer_hip_mmq_port
+                if not use_triton_activation:
                     silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
                 else:
                     act_and_mul_triton(
@@ -658,7 +1116,7 @@ def fused_experts_impl(
                     )
 
         elif _is_hip:
-            if _use_aiter:
+            if _use_aiter_moe_sum:
                 moe_sum(
                     intermediate_cache3.view(*intermediate_cache3.shape),
                     out_hidden_states[begin_chunk_idx:end_chunk_idx],

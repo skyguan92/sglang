@@ -10,10 +10,34 @@ import torch
 import triton
 
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import get_device_name, is_hip
+from sglang.srt.utils import get_bool_env_var, get_device_name, is_hip
 
 logger = logging.getLogger(__name__)
 _is_hip = is_hip()
+_use_unifyinfer_hip_mmq_port = (
+    get_bool_env_var("UNIFYINFER_FUSED_MOE_HIP_MMQ_PORT") and _is_hip
+)
+
+
+def _get_unifyinfer_hip_mmq_config(K: int, is_down_moe: bool) -> Dict[str, int]:
+    # Experimental gfx1151 preset for the rS14 mmq/expf probe.
+    # Use a logical 48-token block while padding Triton lanes to 64.
+    # This keeps routing/alignment on the intended mmq-style shape without
+    # requiring the kernel to materialize a non-power-of-two tl.arange.
+    config: Dict[str, int] = {
+        "BLOCK_SIZE_M": 48,
+        "BLOCK_SIZE_M_PADDED": 64,
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 256 if K % 256 == 0 else 128,
+        "GROUP_SIZE_M": 1 if is_down_moe else 4,
+        "num_warps": 4,
+        "waves_per_eu": 1,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+    }
+    if is_down_moe:
+        config["USE_TMA"] = False
+    return config
 
 
 def get_config_file_name(
@@ -218,6 +242,13 @@ def try_get_optimal_moe_config(
     override_config = get_config()
     if override_config:
         config = override_config
+    elif _use_unifyinfer_hip_mmq_port and not is_marlin:
+        config = _get_unifyinfer_hip_mmq_config(w1_shape[2], is_down_moe=False)
+        if return_down_config:
+            down_config = _get_unifyinfer_hip_mmq_config(
+                w1_shape[2], is_down_moe=True
+            )
+            max_block_m = config["BLOCK_SIZE_M"]
     else:
         # First try to load optimal config from the file
         E, _, N = w2_shape
