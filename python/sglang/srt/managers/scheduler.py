@@ -244,6 +244,8 @@ else:
 
 logger = logging.getLogger(__name__)
 
+ENABLE_PREFILL_ASYNC_READBACK = os.getenv("ENABLE_PREFILL_ASYNC_READBACK") == "1"
+
 # Test retract decode for debugging purposes
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
@@ -2861,6 +2863,18 @@ class Scheduler(
             else:
                 batch_result.extend_input_len_per_req = None
                 batch_result.extend_logprob_start_len_per_req = None
+
+            # Keep scheduler ordering unchanged, but allow an opt-in async CPU
+            # copy on non-overlap prefill so result handling can avoid paying
+            # the full host readback cost at tolist() time.
+            if (
+                ENABLE_PREFILL_ASYNC_READBACK
+                and not self.enable_overlap
+                and batch.forward_mode == ForwardMode.EXTEND
+                and batch_result.copy_done is None
+            ):
+                batch_result.copy_done = self.device_module.Event()
+                batch_result.copy_to_cpu(return_logprob=batch.return_logprob)
 
             ret = batch_result
         else:  # embedding or reward model
