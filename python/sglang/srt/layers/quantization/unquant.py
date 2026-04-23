@@ -64,6 +64,9 @@ _use_qwen35_hipb_explicit_220_class_gdn_inproj = (
 _use_qwen35_hipb_explicit_220_out_proj = (
     get_bool_env_var("UNIFYINFER_QWEN35_HIPB_EXPLICIT_220_OUT_PROJ") and _is_hip
 )
+_use_qwen35_hipb_auto_220_out_proj = (
+    get_bool_env_var("UNIFYINFER_QWEN35_HIPB_AUTO_220_OUT_PROJ") and _is_hip
+)
 _use_qwen35_hipb_explicit_208_attn_qkv = (
     get_bool_env_var("UNIFYINFER_QWEN35_HIPB_EXPLICIT_208_ATTN_QKV") and _is_hip
 )
@@ -74,6 +77,7 @@ _use_qwen35_projection_tuned_gemm = (
     _use_qwen35_hipb_explicit_220_proj_selective
     or _use_qwen35_hipb_explicit_220_class_gdn_inproj
     or _use_qwen35_hipb_explicit_220_out_proj
+    or _use_qwen35_hipb_auto_220_out_proj
     or _use_qwen35_hipb_explicit_208_attn_qkv
     or _use_qwen35_hipb_explicit_192_attn_qkv
 )
@@ -264,6 +268,13 @@ def _maybe_get_qwen35_hipb_explicit_solution_id(
     if _use_qwen35_hipb_explicit_220_out_proj and k == 4096:
         if m == 220 and n == 2048:
             return 5611
+    # `rS15di` then showed that explicit `5611` stays live-negative even though
+    # the corrected exact shape is synthetic-positive. Keep the next reopen
+    # narrower still: probe `hipb_auto` on the same exact-220 out-proj shape
+    # without promoting it into the standing contract.
+    if _use_qwen35_hipb_auto_220_out_proj and k == 4096:
+        if m == 220 and n == 2048:
+            return -1
     # `rS15cz` reopened the `9216` full-attn qkv path synthetically at
     # `m=208`, but `rS15db` kept the live contract from promoting there.
     # Keep this gate probe-only rather than part of the standing path.
