@@ -61,11 +61,21 @@ _use_qwen35_hipb_explicit_220_proj_selective = (
 _use_qwen35_hipb_explicit_220_class_gdn_inproj = (
     get_bool_env_var("UNIFYINFER_QWEN35_HIPB_EXPLICIT_220_CLASS_GDN_INPROJ") and _is_hip
 )
+_use_qwen35_hipb_explicit_220_out_proj = (
+    get_bool_env_var("UNIFYINFER_QWEN35_HIPB_EXPLICIT_220_OUT_PROJ") and _is_hip
+)
 _use_qwen35_hipb_explicit_208_attn_qkv = (
     get_bool_env_var("UNIFYINFER_QWEN35_HIPB_EXPLICIT_208_ATTN_QKV") and _is_hip
 )
 _use_qwen35_hipb_explicit_192_attn_qkv = (
     get_bool_env_var("UNIFYINFER_QWEN35_HIPB_EXPLICIT_192_ATTN_QKV") and _is_hip
+)
+_use_qwen35_projection_tuned_gemm = (
+    _use_qwen35_hipb_explicit_220_proj_selective
+    or _use_qwen35_hipb_explicit_220_class_gdn_inproj
+    or _use_qwen35_hipb_explicit_220_out_proj
+    or _use_qwen35_hipb_explicit_208_attn_qkv
+    or _use_qwen35_hipb_explicit_192_attn_qkv
 )
 _cache_unifyinfer_prepacked_w13 = (
     get_bool_env_var("UNIFYINFER_EXPERIMENTAL_MOE_CACHE_PREPACKED_W13") and _is_hip
@@ -74,7 +84,7 @@ _single_storage_unifyinfer_w13 = (
     get_bool_env_var("UNIFYINFER_EXPERIMENTAL_MOE_SINGLE_STORAGE_W13") and _is_hip
 )
 
-if _use_aiter:
+if _use_aiter or _use_qwen35_projection_tuned_gemm:
     from aiter.tuned_gemm import hipb_gemm, tgemm
 
 if _use_aiter_fused_moe:
@@ -179,7 +189,12 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 output = output.view(x_shapes[0], x_shapes[1], -1)
             return output
 
-        elif _use_aiter and type(layer.weight.data) is torch.Tensor:
+        elif (_use_aiter or _use_qwen35_projection_tuned_gemm) and type(
+            layer.weight.data
+        ) is torch.Tensor:
+            if _use_qwen35_projection_tuned_gemm and not _use_aiter:
+                if not _should_use_qwen35_projection_tuned_gemm(x, layer.weight):
+                    return F.linear(x, layer.weight, bias)
             solution_id = _maybe_get_qwen35_hipb_explicit_solution_id(x, layer.weight)
             if solution_id is not None:
                 return hipb_gemm(
@@ -198,41 +213,68 @@ class UnquantizedLinearMethod(LinearMethodBase):
         return F.linear(x, layer.weight, bias)
 
 
+def _should_use_qwen35_projection_tuned_gemm(
+    x: torch.Tensor, weight: torch.Tensor
+) -> bool:
+    if x.ndim != 2:
+        return False
+    if weight.ndim != 2:
+        return False
+    if weight.shape[1] != x.shape[1]:
+        return False
+    # Keep the probe narrow to the exact large projection families we are
+    # adjudicating. Small helper shapes like `in_proj_ba` (`-> 64`) should stay
+    # on the old F.linear path so smoke/reference traffic does not reopen the
+    # unrelated AITER `module_custom.so` ABI surface.
+    if x.shape[1] == 2048 and weight.shape[0] in (12288, 9216):
+        return True
+    if x.shape[1] == 4096 and weight.shape[0] == 2048:
+        return True
+    return False
+
+
 def _maybe_get_qwen35_hipb_explicit_solution_id(
     x: torch.Tensor, weight: torch.Tensor
 ) -> int | None:
     if x.ndim != 2:
         return None
-    if x.shape[1] != 2048:
-        return None
     if weight.ndim != 2:
         return None
-    if weight.shape[1] != 2048:
+    if weight.shape[1] != x.shape[1]:
         return None
+    m, k = x.shape
+    n = weight.shape[0]
     # `rS15ct` exhaustive sweep found that solution 5622 is the best legal
     # explicit hipBLASLt point for the two dominant fused qwen3.5 projection
     # shapes at the prompt-220 prefill point, while `4096` remained negative.
-    if _use_qwen35_hipb_explicit_220_proj_selective:
-        if x.shape[0] == 220 and weight.shape[0] in (12288, 9216):
+    if _use_qwen35_hipb_explicit_220_proj_selective and k == 2048:
+        if m == 220 and n in (12288, 9216):
             return 5622
     # `rS15cw` then showed a narrower follow-up: the `12288` GDN in-proj path
     # keeps the same winning explicit point across a bounded prompt-220-class
     # window (`192/208/220/224`), while the `9216` full-attn path only stayed
     # positive at the original `m=220` point.
-    if _use_qwen35_hipb_explicit_220_class_gdn_inproj:
-        if x.shape[0] in (192, 208, 220, 224) and weight.shape[0] == 12288:
+    if _use_qwen35_hipb_explicit_220_class_gdn_inproj and k == 2048:
+        if m in (192, 208, 220, 224) and n == 12288:
             return 5622
+    # `rS15de/rS15df` corrected the old shared out-proj synthetic provenance:
+    # the real qwen3.5 family is `220 x 4096 -> 2048`, not `220 x 2048 -> 4096`.
+    # On that exact shape, explicit solution `5611` reopens as a probe-only
+    # serving candidate against the current mixed standing contract.
+    if _use_qwen35_hipb_explicit_220_out_proj and k == 4096:
+        if m == 220 and n == 2048:
+            return 5611
     # `rS15cz` reopened the `9216` full-attn qkv path synthetically at
     # `m=208`, but `rS15db` kept the live contract from promoting there.
     # Keep this gate probe-only rather than part of the standing path.
-    if _use_qwen35_hipb_explicit_208_attn_qkv:
-        if x.shape[0] == 208 and weight.shape[0] == 9216:
+    if _use_qwen35_hipb_explicit_208_attn_qkv and k == 2048:
+        if m == 208 and n == 9216:
             return 5622
     # `rS15cz` found an even stronger synthetic 9216 point at `m=192`, but
     # `rS15dc` was already prefill-negative on the first trusted surface.
     # Keep this gate probe-only too.
-    if _use_qwen35_hipb_explicit_192_attn_qkv:
-        if x.shape[0] == 192 and weight.shape[0] == 9216:
+    if _use_qwen35_hipb_explicit_192_attn_qkv and k == 2048:
+        if m == 192 and n == 9216:
             return 5607
     return None
 
