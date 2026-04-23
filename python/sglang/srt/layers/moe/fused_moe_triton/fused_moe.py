@@ -67,6 +67,9 @@ _use_unifyinfer_mixed_tail_w13_direct_io = (
 _use_unifyinfer_sorted_prepacked_w13 = (
     get_bool_env_var("UNIFYINFER_EXPERIMENTAL_MOE_SORTED_PREPACKED_W13") and _is_hip
 )
+_use_unifyinfer_device_tail_block_w13 = (
+    get_bool_env_var("UNIFYINFER_EXPERIMENTAL_MOE_DEVICE_TAIL_BLOCK_W13") and _is_hip
+)
 
 
 if _is_cuda:
@@ -580,6 +583,135 @@ def _grouped_tail_prepacked_direct_io_kernel(
 
 
 @triton.jit
+def _compact_tail_block_ids_kernel(
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    tail_block_ids_ptr,
+    tail_block_count_ptr,
+    max_tail_blocks,
+    num_valid_tokens,
+    BLOCK_SIZE_M: tl.constexpr,
+):
+    pid_block = tl.program_id(axis=0)
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    num_blocks = tl.cdiv(num_tokens_post_padded, BLOCK_SIZE_M)
+    if pid_block >= num_blocks:
+        return
+
+    block_start = pid_block * BLOCK_SIZE_M
+    first_token = tl.load(sorted_token_ids_ptr + block_start)
+    last_token = tl.load(sorted_token_ids_ptr + block_start + BLOCK_SIZE_M - 1)
+    is_tail_block = (first_token < num_valid_tokens) & (last_token >= num_valid_tokens)
+    out_idx = tl.atomic_add(
+        tail_block_count_ptr,
+        1,
+        sem="relaxed",
+        mask=is_tail_block,
+    )
+    tl.store(
+        tail_block_ids_ptr + out_idx,
+        pid_block,
+        mask=is_tail_block & (out_idx < max_tail_blocks),
+    )
+
+
+@triton.jit
+def _counted_tail_block_prepacked_direct_io_kernel(
+    hidden_states_ptr,
+    topk_weights_ptr,
+    b_ptr,
+    c_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    tail_block_ids_ptr,
+    tail_block_count_ptr,
+    max_tail_blocks,
+    num_valid_tokens,
+    N,
+    K,
+    top_k,
+    stride_hm,
+    stride_hk,
+    stride_be,
+    stride_bn,
+    stride_bk,
+    stride_cm,
+    stride_cn,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    APPLY_ROUTER_WEIGHT: tl.constexpr,
+    FILTER_EXPERT: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    pid_tail_block = pid // num_pid_n
+    pid_n = pid % num_pid_n
+
+    tail_block_count = tl.load(tail_block_count_ptr)
+    if pid_tail_block >= max_tail_blocks or pid_tail_block >= tail_block_count:
+        return
+
+    block_id = tl.load(tail_block_ids_ptr + pid_tail_block).to(tl.int64)
+    block_start = block_id * BLOCK_SIZE_M
+    expert_id = tl.load(expert_ids_ptr + block_id).to(tl.int64)
+    offs_m = tl.arange(0, BLOCK_SIZE_M)
+    assignment_ids = tl.load(
+        sorted_token_ids_ptr + block_start + offs_m,
+        mask=offs_m < BLOCK_SIZE_M,
+        other=num_valid_tokens,
+    ).to(tl.int64)
+    token_mask = assignment_ids < num_valid_tokens
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+
+    if FILTER_EXPERT and expert_id == -1:
+        zeros = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        tl.store(
+            c_ptr + assignment_ids[:, None] * stride_cm + offs_n[None, :] * stride_cn,
+            zeros,
+            mask=token_mask[:, None] & (offs_n[None, :] < N),
+        )
+        return
+    if expert_id < 0:
+        return
+
+    src_rows = assignment_ids // top_k
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for k_start in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        offs_k = k_start * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+        a = tl.load(
+            hidden_states_ptr
+            + src_rows[:, None] * stride_hm
+            + offs_k[None, :] * stride_hk,
+            mask=token_mask[:, None] & (offs_k[None, :] < K),
+            other=0.0,
+        )
+        if APPLY_ROUTER_WEIGHT:
+            router_weights = tl.load(
+                topk_weights_ptr + assignment_ids,
+                mask=token_mask,
+                other=0.0,
+            )
+            a = a * router_weights[:, None]
+        b = tl.load(
+            b_ptr
+            + expert_id * stride_be
+            + offs_n[None, :] * stride_bn
+            + offs_k[:, None] * stride_bk,
+            mask=(offs_n[None, :] < N) & (offs_k[:, None] < K),
+            other=0.0,
+        )
+        acc += tl.dot(a, b)
+
+    tl.store(
+        c_ptr + assignment_ids[:, None] * stride_cm + offs_n[None, :] * stride_cn,
+        acc,
+        mask=token_mask[:, None] & (offs_n[None, :] < N),
+    )
+
+
+@triton.jit
 def _sorted_prepacked_w13_kernel(
     hidden_states_ptr,
     topk_weights_ptr,
@@ -763,6 +895,38 @@ def _should_use_unifyinfer_sorted_prepacked_w13(
     )
 
 
+def _should_use_unifyinfer_device_tail_block_w13(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w1_prepacked: Optional[torch.Tensor],
+    b1: Optional[torch.Tensor],
+    use_fp8_w8a8: bool,
+    use_int8_w8a8: bool,
+    use_int8_w8a16: bool,
+    use_int4_w4a16: bool,
+    per_channel_quant: bool,
+    w1_scale: Optional[torch.Tensor],
+    w1_zp: Optional[torch.Tensor],
+    a1_scale: Optional[torch.Tensor],
+    block_shape: Optional[List[int]],
+) -> bool:
+    return (
+        _use_unifyinfer_device_tail_block_w13
+        and _is_unifyinfer_single_storage_w13_alias(w1, w1_prepacked)
+        and b1 is None
+        and hidden_states.dtype == torch.bfloat16
+        and not use_fp8_w8a8
+        and not use_int8_w8a8
+        and not use_int8_w8a16
+        and not use_int4_w4a16
+        and not per_channel_quant
+        and w1_scale is None
+        and w1_zp is None
+        and a1_scale is None
+        and block_shape is None
+    )
+
+
 def _invoke_unifyinfer_sorted_prepacked_w13(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -815,6 +979,118 @@ def _invoke_unifyinfer_sorted_prepacked_w13(
         APPLY_ROUTER_WEIGHT=mul_routed_weight,
         FILTER_EXPERT=filter_expert,
         num_warps=4,
+    )
+
+
+def _invoke_unifyinfer_device_tail_block_w13(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w1_prepacked: torch.Tensor,
+    intermediate_cache1: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    mul_routed_weight: bool,
+    top_k: int,
+    config: dict,
+    compute_type: tl.dtype,
+    filter_expert: bool,
+) -> None:
+    block_size_m = int(config["BLOCK_SIZE_M"])
+    block_size_n = max(int(config["BLOCK_SIZE_N"]), 64)
+    block_size_k = 64
+    if hidden_states.shape[1] % block_size_k != 0:
+        raise ValueError(
+            "device-tail-block W13 requires K to be divisible by 64"
+        )
+
+    invoke_fused_moe_kernel(
+        hidden_states,
+        w1,
+        None,
+        intermediate_cache1,
+        None,
+        None,
+        None,
+        topk_weights,
+        topk_ids,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        mul_routed_weight,
+        top_k,
+        config,
+        compute_type=compute_type,
+        use_fp8_w8a8=False,
+        use_int8_w8a8=False,
+        use_int8_w8a16=False,
+        use_int4_w4a16=False,
+        per_channel_quant=False,
+        block_shape=None,
+        filter_expert=filter_expert,
+        unifyinfer_skip_partial_blocks=True,
+    )
+
+    max_tail_blocks = int(expert_ids.numel())
+    if max_tail_blocks <= 0:
+        return
+
+    tail_block_ids = torch.empty(
+        (max_tail_blocks,),
+        device=hidden_states.device,
+        dtype=torch.long,
+    )
+    tail_block_count = torch.zeros(
+        (1,),
+        device=hidden_states.device,
+        dtype=torch.int32,
+    )
+    _compact_tail_block_ids_kernel[(max_tail_blocks,)](
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        tail_block_ids,
+        tail_block_count,
+        max_tail_blocks,
+        topk_ids.numel(),
+        BLOCK_SIZE_M=block_size_m,
+        num_warps=1,
+    )
+    _counted_tail_block_prepacked_direct_io_kernel[
+        lambda meta: (
+            max_tail_blocks
+            * triton.cdiv(w1.shape[1], meta["BLOCK_SIZE_N"]),
+        )
+    ](
+        hidden_states,
+        topk_weights,
+        w1_prepacked,
+        intermediate_cache1,
+        sorted_token_ids,
+        expert_ids,
+        tail_block_ids,
+        tail_block_count,
+        max_tail_blocks,
+        topk_ids.numel(),
+        w1.shape[1],
+        hidden_states.shape[1],
+        top_k,
+        hidden_states.stride(0),
+        hidden_states.stride(1),
+        w1_prepacked.stride(0),
+        w1_prepacked.stride(2),
+        w1_prepacked.stride(1),
+        intermediate_cache1.stride(0),
+        intermediate_cache1.stride(1),
+        BLOCK_SIZE_M=block_size_m,
+        BLOCK_SIZE_N=block_size_n,
+        BLOCK_SIZE_K=block_size_k,
+        APPLY_ROUTER_WEIGHT=mul_routed_weight,
+        FILTER_EXPERT=filter_expert,
+        num_warps=4,
+        num_stages=2,
     )
 
 
@@ -1230,7 +1506,38 @@ def fused_experts_impl(
             curr_topk_ids, config["BLOCK_SIZE_M"], E
         )
 
-        if _should_use_unifyinfer_sorted_prepacked_w13(
+        if _should_use_unifyinfer_device_tail_block_w13(
+            hidden_states=curr_hidden_states,
+            w1=w1,
+            w1_prepacked=w1_prepacked,
+            b1=b1,
+            use_fp8_w8a8=use_fp8_w8a8,
+            use_int8_w8a8=use_int8_w8a8,
+            use_int8_w8a16=use_int8_w8a16,
+            use_int4_w4a16=use_int4_w4a16,
+            per_channel_quant=per_channel_quant,
+            w1_scale=w1_scale,
+            w1_zp=w1_zp,
+            a1_scale=a1_scale,
+            block_shape=block_shape,
+        ):
+            _invoke_unifyinfer_device_tail_block_w13(
+                hidden_states=curr_hidden_states,
+                w1=w1,
+                w1_prepacked=w1_prepacked,
+                intermediate_cache1=intermediate_cache1,
+                topk_weights=curr_topk_weights,
+                topk_ids=curr_topk_ids,
+                sorted_token_ids=sorted_token_ids,
+                expert_ids=expert_ids,
+                num_tokens_post_padded=num_tokens_post_padded,
+                mul_routed_weight=apply_router_weight_on_input,
+                top_k=topk_ids.shape[1],
+                config=config,
+                compute_type=compute_type,
+                filter_expert=filter_expert,
+            )
+        elif _should_use_unifyinfer_sorted_prepacked_w13(
             hidden_states=curr_hidden_states,
             w1=w1,
             w1_prepacked=w1_prepacked,

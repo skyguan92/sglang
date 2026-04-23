@@ -393,6 +393,7 @@ def fused_moe_kernel(
     FUSE_ADD_TO_OUTPUT: tl.constexpr,
     FUSE_SUM_ALL_REDUCE: tl.constexpr,
     ROUTER_TOPK: tl.constexpr,
+    UNIFYINFER_SKIP_PARTIAL_BLOCKS: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -456,6 +457,13 @@ def fused_moe_kernel(
 
     off_experts_i32 = tl.load(expert_ids_ptr + pid_m)
     off_experts = off_experts_i32.to(tl.int64)
+
+    if UNIFYINFER_SKIP_PARTIAL_BLOCKS:
+        tail_marker = tl.load(
+            sorted_token_ids_ptr + pid_m * BLOCK_SIZE_M + BLOCK_SIZE_M - 1
+        )
+        if tail_marker >= num_valid_tokens:
+            return
 
     if filter_expert and off_experts == -1:
         # -----------------------------------------------------------
@@ -749,6 +757,7 @@ def invoke_fused_moe_kernel(
     router_topk: int = 1,
     fuse_add_to_output: bool = False,
     add_output_mask: Optional[torch.Tensor] = None,
+    unifyinfer_skip_partial_blocks: bool = False,
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
@@ -837,6 +846,10 @@ def invoke_fused_moe_kernel(
         and block_shape is not None
         and block_shape[1] > 0
     ):
+        assert not unifyinfer_skip_partial_blocks, (
+            "unifyinfer_skip_partial_blocks is only implemented for the regular "
+            "fused_moe_kernel path"
+        )
         assert (
             not fuse_sum_all_reduce
         ), "fuse_sum_all_reduce is not supported for GPTQ/AWQ kernels"
@@ -954,6 +967,7 @@ def invoke_fused_moe_kernel(
             FUSE_ADD_TO_OUTPUT=fuse_add_to_output,
             FUSE_SUM_ALL_REDUCE=fuse_sum_all_reduce,
             ROUTER_TOPK=router_topk,
+            UNIFYINFER_SKIP_PARTIAL_BLOCKS=unifyinfer_skip_partial_blocks,
             **config,
         )
 
