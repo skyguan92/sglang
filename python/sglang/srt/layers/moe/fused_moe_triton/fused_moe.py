@@ -64,6 +64,9 @@ _use_unifyinfer_mixed_tail_w13_direct_io = (
     get_bool_env_var("UNIFYINFER_EXPERIMENTAL_MOE_MIXED_TAIL_W13_DIRECT_IO")
     and _is_hip
 )
+_use_unifyinfer_sorted_prepacked_w13 = (
+    get_bool_env_var("UNIFYINFER_EXPERIMENTAL_MOE_SORTED_PREPACKED_W13") and _is_hip
+)
 
 
 if _is_cuda:
@@ -576,6 +579,104 @@ def _grouped_tail_prepacked_direct_io_kernel(
     )
 
 
+@triton.jit
+def _sorted_prepacked_w13_kernel(
+    hidden_states_ptr,
+    topk_weights_ptr,
+    b_ptr,
+    c_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    EM,
+    num_valid_tokens,
+    N,
+    K,
+    top_k,
+    stride_hm,
+    stride_hk,
+    stride_be,
+    stride_bn,
+    stride_bk,
+    stride_cm,
+    stride_cn,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    APPLY_ROUTER_WEIGHT: tl.constexpr,
+    FILTER_EXPERT: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
+        return
+
+    offs_m = tl.arange(0, BLOCK_SIZE_M)
+    offs_token_id = pid_m * BLOCK_SIZE_M + offs_m
+    logical_token_mask = offs_token_id < EM
+    assignment_ids = tl.load(
+        sorted_token_ids_ptr + offs_token_id,
+        mask=logical_token_mask,
+        other=num_valid_tokens,
+    ).to(tl.int64)
+    token_mask = logical_token_mask & (assignment_ids < num_valid_tokens)
+    expert_id = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+
+    if FILTER_EXPERT and expert_id == -1:
+        zeros = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        tl.store(
+            c_ptr + assignment_ids[:, None] * stride_cm + offs_n[None, :] * stride_cn,
+            zeros,
+            mask=token_mask[:, None] & (offs_n[None, :] < N),
+        )
+        return
+
+    src_rows = assignment_ids // top_k
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for k_start in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        offs_k = k_start * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+        a = tl.load(
+            hidden_states_ptr
+            + src_rows[:, None] * stride_hm
+            + offs_k[None, :] * stride_hk,
+            mask=token_mask[:, None] & (offs_k[None, :] < K),
+            other=0.0,
+        )
+        if APPLY_ROUTER_WEIGHT:
+            router_weights = tl.load(
+                topk_weights_ptr + assignment_ids,
+                mask=token_mask,
+                other=0.0,
+            )
+            a = a * router_weights[:, None]
+        b = tl.load(
+            b_ptr
+            + expert_id * stride_be
+            + offs_n[None, :] * stride_bn
+            + offs_k[:, None] * stride_bk,
+            mask=(offs_n[None, :] < N) & (offs_k[:, None] < K),
+            other=0.0,
+        )
+        acc += tl.dot(a, b)
+
+    tl.store(
+        c_ptr + assignment_ids[:, None] * stride_cm + offs_n[None, :] * stride_cn,
+        acc,
+        mask=token_mask[:, None] & (offs_n[None, :] < N),
+    )
+
+
 def _should_use_unifyinfer_mixed_tail_w13(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -627,6 +728,93 @@ def _is_unifyinfer_single_storage_w13_alias(
         and w1.stride(0) == w1_prepacked.stride(0)
         and w1.stride(1) == w1_prepacked.stride(2)
         and w1.stride(2) == w1_prepacked.stride(1)
+    )
+
+
+def _should_use_unifyinfer_sorted_prepacked_w13(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w1_prepacked: Optional[torch.Tensor],
+    b1: Optional[torch.Tensor],
+    use_fp8_w8a8: bool,
+    use_int8_w8a8: bool,
+    use_int8_w8a16: bool,
+    use_int4_w4a16: bool,
+    per_channel_quant: bool,
+    w1_scale: Optional[torch.Tensor],
+    w1_zp: Optional[torch.Tensor],
+    a1_scale: Optional[torch.Tensor],
+    block_shape: Optional[List[int]],
+) -> bool:
+    return (
+        _use_unifyinfer_sorted_prepacked_w13
+        and _is_unifyinfer_single_storage_w13_alias(w1, w1_prepacked)
+        and b1 is None
+        and hidden_states.dtype == torch.bfloat16
+        and not use_fp8_w8a8
+        and not use_int8_w8a8
+        and not use_int8_w8a16
+        and not use_int4_w4a16
+        and not per_channel_quant
+        and w1_scale is None
+        and w1_zp is None
+        and a1_scale is None
+        and block_shape is None
+    )
+
+
+def _invoke_unifyinfer_sorted_prepacked_w13(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w1_prepacked: torch.Tensor,
+    intermediate_cache1: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    mul_routed_weight: bool,
+    top_k: int,
+    config: dict,
+    filter_expert: bool,
+) -> None:
+    block_size_m = int(config["BLOCK_SIZE_M"])
+    block_size_n = int(config["BLOCK_SIZE_N"])
+    block_size_k = int(config["BLOCK_SIZE_K"])
+    _sorted_prepacked_w13_kernel[
+        lambda meta: (
+            (
+                triton.cdiv(sorted_token_ids.shape[0], meta["BLOCK_SIZE_M"])
+                * triton.cdiv(w1.shape[1], meta["BLOCK_SIZE_N"])
+            ),
+        )
+    ](
+        hidden_states,
+        topk_weights,
+        w1_prepacked,
+        intermediate_cache1,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        sorted_token_ids.shape[0],
+        topk_ids.numel(),
+        w1.shape[1],
+        hidden_states.shape[1],
+        top_k,
+        hidden_states.stride(0),
+        hidden_states.stride(1),
+        w1_prepacked.stride(0),
+        w1_prepacked.stride(2),
+        w1_prepacked.stride(1),
+        intermediate_cache1.stride(0),
+        intermediate_cache1.stride(1),
+        BLOCK_SIZE_M=block_size_m,
+        BLOCK_SIZE_N=block_size_n,
+        BLOCK_SIZE_K=block_size_k,
+        GROUP_SIZE_M=int(config["GROUP_SIZE_M"]),
+        APPLY_ROUTER_WEIGHT=mul_routed_weight,
+        FILTER_EXPERT=filter_expert,
+        num_warps=4,
     )
 
 
@@ -1042,7 +1230,37 @@ def fused_experts_impl(
             curr_topk_ids, config["BLOCK_SIZE_M"], E
         )
 
-        if _should_use_unifyinfer_mixed_tail_w13(
+        if _should_use_unifyinfer_sorted_prepacked_w13(
+            hidden_states=curr_hidden_states,
+            w1=w1,
+            w1_prepacked=w1_prepacked,
+            b1=b1,
+            use_fp8_w8a8=use_fp8_w8a8,
+            use_int8_w8a8=use_int8_w8a8,
+            use_int8_w8a16=use_int8_w8a16,
+            use_int4_w4a16=use_int4_w4a16,
+            per_channel_quant=per_channel_quant,
+            w1_scale=w1_scale,
+            w1_zp=w1_zp,
+            a1_scale=a1_scale,
+            block_shape=block_shape,
+        ):
+            _invoke_unifyinfer_sorted_prepacked_w13(
+                hidden_states=curr_hidden_states,
+                w1=w1,
+                w1_prepacked=w1_prepacked,
+                intermediate_cache1=intermediate_cache1,
+                topk_weights=curr_topk_weights,
+                topk_ids=curr_topk_ids,
+                sorted_token_ids=sorted_token_ids,
+                expert_ids=expert_ids,
+                num_tokens_post_padded=num_tokens_post_padded,
+                mul_routed_weight=apply_router_weight_on_input,
+                top_k=topk_ids.shape[1],
+                config=config,
+                filter_expert=filter_expert,
+            )
+        elif _should_use_unifyinfer_mixed_tail_w13(
             hidden_states=curr_hidden_states,
             w1=w1,
             w1_prepacked=w1_prepacked,
