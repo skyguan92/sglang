@@ -67,6 +67,9 @@ _use_qwen35_hipb_explicit_220_out_proj = (
 _use_qwen35_hipb_auto_220_out_proj = (
     get_bool_env_var("UNIFYINFER_QWEN35_HIPB_AUTO_220_OUT_PROJ") and _is_hip
 )
+_use_qwen35_pretransposed_out_proj = (
+    get_bool_env_var("UNIFYINFER_QWEN35_PRETRANSPOSED_OUT_PROJ") and _is_hip
+)
 _use_qwen35_hipb_explicit_208_attn_qkv = (
     get_bool_env_var("UNIFYINFER_QWEN35_HIPB_EXPLICIT_208_ATTN_QKV") and _is_hip
 )
@@ -172,6 +175,12 @@ class UnquantizedLinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["weight"])
+        if _use_qwen35_pretransposed_out_proj and _is_qwen35_out_proj_weight(
+            layer.weight
+        ):
+            layer._unifyinfer_qwen35_out_proj_weight_t = (
+                layer.weight.data.t().contiguous()
+            )
 
     def apply(
         self,
@@ -191,6 +200,21 @@ class UnquantizedLinearMethod(LinearMethodBase):
             )
             if len(x_shapes) == 3:
                 output = output.view(x_shapes[0], x_shapes[1], -1)
+            return output
+
+        elif (
+            _use_qwen35_pretransposed_out_proj
+            and _is_qwen35_out_proj_weight(layer.weight)
+            and x.ndim == 2
+            and x.shape[1] == 4096
+        ):
+            weight_t = getattr(layer, "_unifyinfer_qwen35_out_proj_weight_t", None)
+            if weight_t is None or weight_t.device != layer.weight.device:
+                weight_t = layer.weight.data.t().contiguous()
+                layer._unifyinfer_qwen35_out_proj_weight_t = weight_t
+            output = torch.mm(x, weight_t)
+            if bias is not None:
+                output = output + bias
             return output
 
         elif (_use_aiter or _use_qwen35_projection_tuned_gemm) and type(
@@ -235,6 +259,12 @@ def _should_use_qwen35_projection_tuned_gemm(
     if x.shape[1] == 4096 and weight.shape[0] == 2048:
         return True
     return False
+
+
+def _is_qwen35_out_proj_weight(weight: torch.Tensor) -> bool:
+    if weight.ndim != 2:
+        return False
+    return weight.shape[0] == 2048 and weight.shape[1] == 4096
 
 
 def _maybe_get_qwen35_hipb_explicit_solution_id(
