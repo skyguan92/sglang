@@ -61,6 +61,12 @@ _use_qwen35_hipb_explicit_220_proj_selective = (
 _use_qwen35_hipb_explicit_220_class_gdn_inproj = (
     get_bool_env_var("UNIFYINFER_QWEN35_HIPB_EXPLICIT_220_CLASS_GDN_INPROJ") and _is_hip
 )
+_use_qwen35_hipb_explicit_208_attn_qkv = (
+    get_bool_env_var("UNIFYINFER_QWEN35_HIPB_EXPLICIT_208_ATTN_QKV") and _is_hip
+)
+_use_qwen35_hipb_explicit_192_attn_qkv = (
+    get_bool_env_var("UNIFYINFER_QWEN35_HIPB_EXPLICIT_192_ATTN_QKV") and _is_hip
+)
 _cache_unifyinfer_prepacked_w13 = (
     get_bool_env_var("UNIFYINFER_EXPERIMENTAL_MOE_CACHE_PREPACKED_W13") and _is_hip
 )
@@ -216,6 +222,18 @@ def _maybe_get_qwen35_hipb_explicit_solution_id(
     if _use_qwen35_hipb_explicit_220_class_gdn_inproj:
         if x.shape[0] in (192, 208, 220, 224) and weight.shape[0] == 12288:
             return 5622
+    # `rS15cz` reopened the `9216` full-attn qkv path synthetically at
+    # `m=208`, but `rS15db` kept the live contract from promoting there.
+    # Keep this gate probe-only rather than part of the standing path.
+    if _use_qwen35_hipb_explicit_208_attn_qkv:
+        if x.shape[0] == 208 and weight.shape[0] == 9216:
+            return 5622
+    # `rS15cz` found an even stronger synthetic 9216 point at `m=192`, but
+    # `rS15dc` was already prefill-negative on the first trusted surface.
+    # Keep this gate probe-only too.
+    if _use_qwen35_hipb_explicit_192_attn_qkv:
+        if x.shape[0] == 192 and weight.shape[0] == 9216:
+            return 5607
     return None
 
 
