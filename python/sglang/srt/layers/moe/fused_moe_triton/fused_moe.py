@@ -19,6 +19,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
+    get_int_env_var,
     is_cpu,
     is_cuda,
     is_hip,
@@ -69,6 +70,16 @@ _use_unifyinfer_sorted_prepacked_w13 = (
 )
 _use_unifyinfer_device_tail_block_w13 = (
     get_bool_env_var("UNIFYINFER_EXPERIMENTAL_MOE_DEVICE_TAIL_BLOCK_W13") and _is_hip
+)
+_unifyinfer_device_tail_block_w13_min_padded_assignments = (
+    get_int_env_var("UNIFYINFER_EXPERIMENTAL_MOE_DEVICE_TAIL_BLOCK_W13_MIN_PADDED_ASSIGNMENTS", 0)
+    if _is_hip
+    else 0
+)
+_unifyinfer_device_tail_block_w13_max_padded_assignments = (
+    get_int_env_var("UNIFYINFER_EXPERIMENTAL_MOE_DEVICE_TAIL_BLOCK_W13_MAX_PADDED_ASSIGNMENTS", 0)
+    if _is_hip
+    else 0
 )
 
 
@@ -909,7 +920,22 @@ def _should_use_unifyinfer_device_tail_block_w13(
     w1_zp: Optional[torch.Tensor],
     a1_scale: Optional[torch.Tensor],
     block_shape: Optional[List[int]],
+    sorted_token_ids: torch.Tensor,
+    topk_ids: torch.Tensor,
 ) -> bool:
+    padded_assignments = int(sorted_token_ids.numel()) - int(topk_ids.numel())
+    if (
+        _unifyinfer_device_tail_block_w13_min_padded_assignments > 0
+        and padded_assignments
+        < _unifyinfer_device_tail_block_w13_min_padded_assignments
+    ):
+        return False
+    if (
+        _unifyinfer_device_tail_block_w13_max_padded_assignments > 0
+        and padded_assignments
+        > _unifyinfer_device_tail_block_w13_max_padded_assignments
+    ):
+        return False
     return (
         _use_unifyinfer_device_tail_block_w13
         and _is_unifyinfer_single_storage_w13_alias(w1, w1_prepacked)
@@ -1520,6 +1546,8 @@ def fused_experts_impl(
             w1_zp=w1_zp,
             a1_scale=a1_scale,
             block_shape=block_shape,
+            sorted_token_ids=sorted_token_ids,
+            topk_ids=curr_topk_ids,
         ):
             _invoke_unifyinfer_device_tail_block_w13(
                 hidden_states=curr_hidden_states,
