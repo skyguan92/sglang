@@ -55,6 +55,9 @@ _disable_aiter_fused_moe = (
     get_bool_env_var("UNIFYINFER_DISABLE_AITER_FUSED_MOE") and _is_hip
 )
 _use_aiter_fused_moe = _use_aiter and not _disable_aiter_fused_moe
+_use_qwen35_hipb_explicit_220_proj_selective = (
+    get_bool_env_var("UNIFYINFER_QWEN35_HIPB_EXPLICIT_220_PROJ_SELECTIVE") and _is_hip
+)
 _cache_unifyinfer_prepacked_w13 = (
     get_bool_env_var("UNIFYINFER_EXPERIMENTAL_MOE_CACHE_PREPACKED_W13") and _is_hip
 )
@@ -63,7 +66,7 @@ _single_storage_unifyinfer_w13 = (
 )
 
 if _use_aiter:
-    from aiter.tuned_gemm import tgemm
+    from aiter.tuned_gemm import hipb_gemm, tgemm
 
 if _use_aiter_fused_moe:
     from aiter import ActivationType
@@ -168,9 +171,43 @@ class UnquantizedLinearMethod(LinearMethodBase):
             return output
 
         elif _use_aiter and type(layer.weight.data) is torch.Tensor:
+            solution_id = _maybe_get_qwen35_hipb_explicit_solution_id(x, layer.weight)
+            if solution_id is not None:
+                return hipb_gemm(
+                    x,
+                    layer.weight,
+                    solution_id,
+                    bias,
+                    x.dtype,
+                    None,
+                    None,
+                    None,
+                    False,
+                )
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
 
         return F.linear(x, layer.weight, bias)
+
+
+def _maybe_get_qwen35_hipb_explicit_solution_id(
+    x: torch.Tensor, weight: torch.Tensor
+) -> int | None:
+    if not _use_qwen35_hipb_explicit_220_proj_selective:
+        return None
+    if x.ndim != 2:
+        return None
+    if x.shape[0] != 220 or x.shape[1] != 2048:
+        return None
+    if weight.ndim != 2:
+        return None
+    if weight.shape[1] != 2048:
+        return None
+    if weight.shape[0] not in (12288, 9216):
+        return None
+    # `rS15ct` exhaustive sweep found that solution 5622 is the best legal
+    # explicit hipBLASLt point for both qwen3.5 fused projection shapes at the
+    # prompt-220 prefill shape, while 4096 remained negative.
+    return 5622
 
 
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
