@@ -58,6 +58,9 @@ _use_aiter_fused_moe = _use_aiter and not _disable_aiter_fused_moe
 _use_qwen35_hipb_explicit_220_proj_selective = (
     get_bool_env_var("UNIFYINFER_QWEN35_HIPB_EXPLICIT_220_PROJ_SELECTIVE") and _is_hip
 )
+_use_qwen35_hipb_explicit_220_class_gdn_inproj = (
+    get_bool_env_var("UNIFYINFER_QWEN35_HIPB_EXPLICIT_220_CLASS_GDN_INPROJ") and _is_hip
+)
 _cache_unifyinfer_prepacked_w13 = (
     get_bool_env_var("UNIFYINFER_EXPERIMENTAL_MOE_CACHE_PREPACKED_W13") and _is_hip
 )
@@ -192,22 +195,28 @@ class UnquantizedLinearMethod(LinearMethodBase):
 def _maybe_get_qwen35_hipb_explicit_solution_id(
     x: torch.Tensor, weight: torch.Tensor
 ) -> int | None:
-    if not _use_qwen35_hipb_explicit_220_proj_selective:
-        return None
     if x.ndim != 2:
         return None
-    if x.shape[0] != 220 or x.shape[1] != 2048:
+    if x.shape[1] != 2048:
         return None
     if weight.ndim != 2:
         return None
     if weight.shape[1] != 2048:
         return None
-    if weight.shape[0] not in (12288, 9216):
-        return None
     # `rS15ct` exhaustive sweep found that solution 5622 is the best legal
-    # explicit hipBLASLt point for both qwen3.5 fused projection shapes at the
-    # prompt-220 prefill shape, while 4096 remained negative.
-    return 5622
+    # explicit hipBLASLt point for the two dominant fused qwen3.5 projection
+    # shapes at the prompt-220 prefill point, while `4096` remained negative.
+    if _use_qwen35_hipb_explicit_220_proj_selective:
+        if x.shape[0] == 220 and weight.shape[0] in (12288, 9216):
+            return 5622
+    # `rS15cw` then showed a narrower follow-up: the `12288` GDN in-proj path
+    # keeps the same winning explicit point across a bounded prompt-220-class
+    # window (`192/208/220/224`), while the `9216` full-attn path only stayed
+    # positive at the original `m=220` point.
+    if _use_qwen35_hipb_explicit_220_class_gdn_inproj:
+        if x.shape[0] in (192, 208, 220, 224) and weight.shape[0] == 12288:
+            return 5622
+    return None
 
 
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
