@@ -56,6 +56,10 @@ _use_unifyinfer_hip_mmq_port = (
 _use_unifyinfer_mixed_tail_w13 = (
     get_bool_env_var("UNIFYINFER_EXPERIMENTAL_MOE_MIXED_TAIL_W13") and _is_hip
 )
+_use_unifyinfer_mixed_tail_w13_no_item = (
+    get_bool_env_var("UNIFYINFER_EXPERIMENTAL_MOE_MIXED_TAIL_W13_NO_ITEM")
+    and _is_hip
+)
 
 
 if _is_cuda:
@@ -545,7 +549,12 @@ def _build_unifyinfer_mixed_tail_metadata(
     num_valid_assignments: int,
 ) -> dict[str, torch.Tensor]:
     device = sorted_token_ids.device
-    num_tokens_post_padded_value = int(num_tokens_post_padded.item())
+    if _use_unifyinfer_mixed_tail_w13_no_item:
+        num_tokens_post_padded_value = (
+            sorted_token_ids.numel() // block_size_m
+        ) * block_size_m
+    else:
+        num_tokens_post_padded_value = int(num_tokens_post_padded.item())
     if num_tokens_post_padded_value <= 0:
         empty_i32 = torch.empty((0,), dtype=torch.int32, device=device)
         return {
@@ -644,7 +653,11 @@ def _invoke_unifyinfer_mixed_tail_w13(
     )
 
     full_num_tokens_post_padded = metadata["full_num_tokens_post_padded"]
-    if int(full_num_tokens_post_padded.item()) > 0:
+    if _use_unifyinfer_mixed_tail_w13_no_item:
+        has_full_blocks = metadata["full_sorted_token_ids"].numel() > 0
+    else:
+        has_full_blocks = int(full_num_tokens_post_padded.item()) > 0
+    if has_full_blocks:
         invoke_fused_moe_kernel(
             hidden_states,
             w1,
