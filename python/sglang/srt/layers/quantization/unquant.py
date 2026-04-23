@@ -70,6 +70,9 @@ _use_qwen35_hipb_auto_220_out_proj = (
 _use_qwen35_pretransposed_out_proj = (
     get_bool_env_var("UNIFYINFER_QWEN35_PRETRANSPOSED_OUT_PROJ") and _is_hip
 )
+_use_qwen35_pretransposed_220_large_proj = (
+    get_bool_env_var("UNIFYINFER_QWEN35_PRETRANSPOSED_220_LARGE_PROJ") and _is_hip
+)
 _use_qwen35_hipb_explicit_208_attn_qkv = (
     get_bool_env_var("UNIFYINFER_QWEN35_HIPB_EXPLICIT_208_ATTN_QKV") and _is_hip
 )
@@ -175,8 +178,15 @@ class UnquantizedLinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["weight"])
-        if _use_qwen35_pretransposed_out_proj and _is_qwen35_out_proj_weight(
-            layer.weight
+        if (
+            (
+                _use_qwen35_pretransposed_out_proj
+                and _is_qwen35_out_proj_weight(layer.weight)
+            )
+            or (
+                _use_qwen35_pretransposed_220_large_proj
+                and _is_qwen35_large_projection_weight(layer.weight)
+            )
         ):
             layer._unifyinfer_qwen35_out_proj_weight_t = (
                 layer.weight.data.t().contiguous()
@@ -207,6 +217,22 @@ class UnquantizedLinearMethod(LinearMethodBase):
             and _is_qwen35_out_proj_weight(layer.weight)
             and x.ndim == 2
             and x.shape[1] == 4096
+        ):
+            weight_t = getattr(layer, "_unifyinfer_qwen35_out_proj_weight_t", None)
+            if weight_t is None or weight_t.device != layer.weight.device:
+                weight_t = layer.weight.data.t().contiguous()
+                layer._unifyinfer_qwen35_out_proj_weight_t = weight_t
+            output = torch.mm(x, weight_t)
+            if bias is not None:
+                output = output + bias
+            return output
+
+        elif (
+            _use_qwen35_pretransposed_220_large_proj
+            and _is_qwen35_large_projection_weight(layer.weight)
+            and x.ndim == 2
+            and x.shape[0] == 220
+            and x.shape[1] == 2048
         ):
             weight_t = getattr(layer, "_unifyinfer_qwen35_out_proj_weight_t", None)
             if weight_t is None or weight_t.device != layer.weight.device:
@@ -265,6 +291,12 @@ def _is_qwen35_out_proj_weight(weight: torch.Tensor) -> bool:
     if weight.ndim != 2:
         return False
     return weight.shape[0] == 2048 and weight.shape[1] == 4096
+
+
+def _is_qwen35_large_projection_weight(weight: torch.Tensor) -> bool:
+    if weight.ndim != 2:
+        return False
+    return weight.shape[1] == 2048 and weight.shape[0] in (12288, 9216)
 
 
 def _maybe_get_qwen35_hipb_explicit_solution_id(
