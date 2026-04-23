@@ -60,6 +60,10 @@ _use_unifyinfer_mixed_tail_w13_no_item = (
     get_bool_env_var("UNIFYINFER_EXPERIMENTAL_MOE_MIXED_TAIL_W13_NO_ITEM")
     and _is_hip
 )
+_use_unifyinfer_mixed_tail_w13_direct_io = (
+    get_bool_env_var("UNIFYINFER_EXPERIMENTAL_MOE_MIXED_TAIL_W13_DIRECT_IO")
+    and _is_hip
+)
 
 
 if _is_cuda:
@@ -487,6 +491,91 @@ def _grouped_tail_direct_weight_kernel(
     )
 
 
+@triton.jit
+def _grouped_tail_prepacked_direct_io_kernel(
+    hidden_states_ptr,
+    topk_weights_ptr,
+    b_ptr,
+    c_ptr,
+    assignment_ids_ptr,
+    starts_ptr,
+    offs_ptr,
+    expert_ids_ptr,
+    total_groups,
+    N,
+    K,
+    top_k,
+    stride_hm,
+    stride_hk,
+    stride_be,
+    stride_bn,
+    stride_bk,
+    stride_cm,
+    stride_cn,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    APPLY_ROUTER_WEIGHT: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    pid_group = pid // num_pid_n
+    pid_n = pid % num_pid_n
+
+    if pid_group >= total_groups:
+        return
+
+    start = tl.load(starts_ptr + pid_group).to(tl.int32)
+    end = tl.load(offs_ptr + pid_group).to(tl.int32)
+    group_rows = end - start
+    if group_rows <= 0:
+        return
+
+    expert_id = tl.load(expert_ids_ptr + pid_group).to(tl.int64)
+    offs_m = tl.arange(0, BLOCK_SIZE_M)
+    compact_rows = start + offs_m
+    assignment_ids = tl.load(
+        assignment_ids_ptr + compact_rows,
+        mask=offs_m < group_rows,
+        other=0,
+    ).to(tl.int64)
+    src_rows = assignment_ids // top_k
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    for k_start in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        offs_k = k_start * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+        a = tl.load(
+            hidden_states_ptr
+            + src_rows[:, None] * stride_hm
+            + offs_k[None, :] * stride_hk,
+            mask=(offs_m[:, None] < group_rows) & (offs_k[None, :] < K),
+            other=0.0,
+        )
+        if APPLY_ROUTER_WEIGHT:
+            router_weights = tl.load(
+                topk_weights_ptr + assignment_ids,
+                mask=offs_m < group_rows,
+                other=0.0,
+            )
+            a = a * router_weights[:, None]
+        b = tl.load(
+            b_ptr
+            + expert_id * stride_be
+            + offs_n[None, :] * stride_bn
+            + offs_k[:, None] * stride_bk,
+            mask=(offs_n[None, :] < N) & (offs_k[:, None] < K),
+            other=0.0,
+        )
+        acc += tl.dot(a, b)
+
+    tl.store(
+        c_ptr + assignment_ids[:, None] * stride_cm + offs_n[None, :] * stride_cn,
+        acc,
+        mask=(offs_m[:, None] < group_rows) & (offs_n[None, :] < N),
+    )
+
+
 def _should_use_unifyinfer_mixed_tail_w13(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -701,6 +790,46 @@ def _invoke_unifyinfer_mixed_tail_w13(
     if tail_assignment_ids.numel() == 0:
         return
 
+    block_size_n = max(int(config["BLOCK_SIZE_N"]), 64)
+    block_size_k = 64
+    if hidden_states.shape[1] % block_size_k != 0:
+        raise ValueError("mixed-tail grouped kernel requires K to be divisible by 64")
+
+    if _use_unifyinfer_mixed_tail_w13_direct_io:
+        _grouped_tail_prepacked_direct_io_kernel[
+            lambda meta: (
+                metadata["tail_expert_ids"].numel()
+                * triton.cdiv(w1.shape[1], meta["BLOCK_SIZE_N"]),
+            )
+        ](
+            hidden_states,
+            topk_weights,
+            w1_prepacked,
+            intermediate_cache1,
+            tail_assignment_ids,
+            metadata["tail_starts"],
+            metadata["tail_ends"],
+            metadata["tail_expert_ids"],
+            metadata["tail_expert_ids"].numel(),
+            w1.shape[1],
+            hidden_states.shape[1],
+            top_k,
+            hidden_states.stride(0),
+            hidden_states.stride(1),
+            w1_prepacked.stride(0),
+            w1_prepacked.stride(2),
+            w1_prepacked.stride(1),
+            intermediate_cache1.stride(0),
+            intermediate_cache1.stride(1),
+            BLOCK_SIZE_M=block_size_m,
+            BLOCK_SIZE_N=block_size_n,
+            BLOCK_SIZE_K=block_size_k,
+            APPLY_ROUTER_WEIGHT=mul_routed_weight,
+            num_warps=4,
+            num_stages=2,
+        )
+        return
+
     tail_assignment_ids_long = tail_assignment_ids.to(dtype=torch.long)
     tail_token_ids = torch.div(
         tail_assignment_ids_long, top_k, rounding_mode="floor"
@@ -717,11 +846,6 @@ def _invoke_unifyinfer_mixed_tail_w13(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-
-    block_size_n = max(int(config["BLOCK_SIZE_N"]), 64)
-    block_size_k = 64
-    if hidden_states.shape[1] % block_size_k != 0:
-        raise ValueError("mixed-tail grouped kernel requires K to be divisible by 64")
 
     _grouped_tail_direct_weight_kernel[
         lambda meta: (
