@@ -81,6 +81,16 @@ _unifyinfer_device_tail_block_w13_max_padded_assignments = (
     if _is_hip
     else 0
 )
+_unifyinfer_device_tail_block_w13_min_active_experts = (
+    get_int_env_var("UNIFYINFER_EXPERIMENTAL_MOE_DEVICE_TAIL_BLOCK_W13_MIN_ACTIVE_EXPERTS", 0)
+    if _is_hip
+    else 0
+)
+_unifyinfer_device_tail_block_w13_max_active_experts = (
+    get_int_env_var("UNIFYINFER_EXPERIMENTAL_MOE_DEVICE_TAIL_BLOCK_W13_MAX_ACTIVE_EXPERTS", 0)
+    if _is_hip
+    else 0
+)
 
 
 if _is_cuda:
@@ -936,6 +946,21 @@ def _should_use_unifyinfer_device_tail_block_w13(
         > _unifyinfer_device_tail_block_w13_max_padded_assignments
     ):
         return False
+    if (
+        _unifyinfer_device_tail_block_w13_min_active_experts > 0
+        or _unifyinfer_device_tail_block_w13_max_active_experts > 0
+    ):
+        active_experts = int(torch.unique(topk_ids[topk_ids >= 0]).numel())
+        if (
+            _unifyinfer_device_tail_block_w13_min_active_experts > 0
+            and active_experts < _unifyinfer_device_tail_block_w13_min_active_experts
+        ):
+            return False
+        if (
+            _unifyinfer_device_tail_block_w13_max_active_experts > 0
+            and active_experts > _unifyinfer_device_tail_block_w13_max_active_experts
+        ):
+            return False
     return (
         _use_unifyinfer_device_tail_block_w13
         and _is_unifyinfer_single_storage_w13_alias(w1, w1_prepacked)
