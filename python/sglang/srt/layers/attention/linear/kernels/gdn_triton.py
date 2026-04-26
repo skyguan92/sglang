@@ -10,6 +10,11 @@ _is_npu = is_npu()
 
 if not _is_cpu:
     from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
+    from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
+    from sglang.srt.layers.attention.linear.kernels.gdn_ggml_row import (
+        can_use_ggml_gdn_row_update,
+        ggml_gdn_row_update,
+    )
     from sglang.srt.layers.attention.fla.fused_recurrent import (
         fused_recurrent_gated_delta_rule_update,
         fused_recurrent_gated_delta_rule_packed_decode,
@@ -47,6 +52,12 @@ _unifyinfer_qwen35_gdn_recurrent_trace_shape_limit = get_int_env_var(
     "UNIFYINFER_QWEN35_GDN_RECURRENT_TRACE_SHAPE_LIMIT", 16
 )
 _unifyinfer_qwen35_gdn_recurrent_trace_shape_count = 0
+_use_unifyinfer_qwen35_gdn_ggml_row_kernel = get_bool_env_var(
+    "UNIFYINFER_QWEN35_GDN_GGML_ROW_KERNEL"
+)
+_unifyinfer_qwen35_gdn_ggml_row_kernel_min_tokens = get_int_env_var(
+    "UNIFYINFER_QWEN35_GDN_GGML_ROW_KERNEL_MIN_TOKENS", 128
+)
 
 
 def _maybe_trace_recurrent_extend_shape(
@@ -290,6 +301,43 @@ class TritonGDNKernel(LinearAttnKernelBase):
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> tuple:
+        has_mamba_track_mask = kwargs.get("has_mamba_track_mask", False)
+        g_is_chunk_cumsum = kwargs.get("g_is_chunk_cumsum", False)
+        if (
+            _use_unifyinfer_qwen35_gdn_ggml_row_kernel
+            and not (_is_cpu or _is_npu)
+            and can_use_ggml_gdn_row_update(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                initial_state=ssm_states,
+                initial_state_indices=cache_indices,
+                min_tokens=_unifyinfer_qwen35_gdn_ggml_row_kernel_min_tokens,
+                has_mamba_track_mask=has_mamba_track_mask,
+                g_is_chunk_cumsum=g_is_chunk_cumsum,
+            )
+        ):
+            q = q.contiguous()
+            k = k.contiguous()
+            v = v.contiguous()
+            g = g.contiguous()
+            beta = beta.contiguous()
+            q = l2norm_fwd(q)
+            k = l2norm_fwd(k)
+            out = ggml_gdn_row_update(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                initial_state=ssm_states,
+                initial_state_indices=cache_indices,
+                scale=k.shape[-1] ** -0.5,
+            )
+            return out, None, None
+
         recurrent_state = ssm_states
         recurrent_state_indices_args = {"initial_state_indices": cache_indices}
         if _is_npu or _is_cpu:
@@ -305,7 +353,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             cu_seqlens=query_start_loc,
             head_first=False,
             use_qk_l2norm_in_kernel=True,
-            g_is_chunk_cumsum=kwargs.get("g_is_chunk_cumsum", False),
+            g_is_chunk_cumsum=g_is_chunk_cumsum,
             **recurrent_state_indices_args,
         )
 
