@@ -4,7 +4,10 @@ from typing import Optional, Tuple, Union
 import torch
 from torch.autograd.profiler import record_function
 
-from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
+from sglang.srt.layers.attention.fla.fused_gdn_gating import (
+    fused_gdn_gating,
+    fused_gdn_gating_chunk_cumsum,
+)
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.utils import (
@@ -20,7 +23,7 @@ from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.utils import get_bool_env_var, is_cpu, is_cuda, is_npu
+from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_cpu, is_cuda, is_npu
 from sglang.srt.utils.common import rank0_log
 
 if not is_cpu():
@@ -53,6 +56,21 @@ elif is_cpu():
 
 _use_unifyinfer_qwen35_trace_attn_split = get_bool_env_var(
     "UNIFYINFER_QWEN35_TRACE_ATTN_SPLIT"
+)
+_use_unifyinfer_qwen35_gdn_fused_gate_cumsum = (
+    get_bool_env_var("UNIFYINFER_QWEN35_GDN_FUSED_GATE_CUMSUM")
+    and get_bool_env_var("UNIFYINFER_QWEN35_FLA_DIRECT_EXTEND_NOAUTOGRAD")
+    and get_bool_env_var("UNIFYINFER_QWEN35_FLA_SINGLE_SEQ_NOVARLEN_EXTEND")
+    and not is_cpu()
+    and not is_npu()
+)
+_use_unifyinfer_qwen35_gdn_recurrent_backend_select = (
+    get_bool_env_var("UNIFYINFER_QWEN35_GDN_RECURRENT_BACKEND_SELECT")
+    and not is_cpu()
+    and not is_npu()
+)
+_unifyinfer_qwen35_gdn_recurrent_backend_select_min_tokens = get_int_env_var(
+    "UNIFYINFER_QWEN35_GDN_RECURRENT_EXTEND_MIN_TOKENS"
 )
 
 
@@ -218,6 +236,79 @@ class GDNKernelDispatcher:
             ssm_states=ssm_states,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
+            **kwargs,
+        )
+
+    def extend_chunk(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        *,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        **kwargs,
+    ) -> tuple:
+        if not hasattr(self.extend_kernel, "extend_chunk"):
+            return self.extend(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                **kwargs,
+            )
+        return self.extend_kernel.extend_chunk(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            **kwargs,
+        )
+
+    def extend_recurrent(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        *,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        **kwargs,
+    ) -> tuple:
+        if not hasattr(self.extend_kernel, "extend_recurrent"):
+            return self.extend(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                **kwargs,
+            )
+        return self.extend_kernel.extend_recurrent(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
             **kwargs,
         )
 
@@ -469,19 +560,65 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     retrieve_parent_token=retrieve_parent_token,
                 )
         else:
+            has_mamba_track_mask = getattr(
+                forward_metadata, "has_mamba_track_mask", False
+            )
+            use_fused_gate_cumsum = (
+                _use_unifyinfer_qwen35_gdn_fused_gate_cumsum
+                and not has_mamba_track_mask
+                and query.shape[0] == 1
+                and query_start_loc is not None
+                and query_start_loc.numel() == 2
+            )
             with _qwen35_gdn_trace_span("_qwen35_gdncore_gate"):
-                g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+                if use_fused_gate_cumsum:
+                    g, beta = fused_gdn_gating_chunk_cumsum(
+                        layer.A_log, a, b, layer.dt_bias
+                    )
+                else:
+                    g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+            use_recurrent_backend_select = (
+                _use_unifyinfer_qwen35_gdn_recurrent_backend_select
+                and not has_mamba_track_mask
+                and query.shape[0] == 1
+                and query.shape[1]
+                >= _unifyinfer_qwen35_gdn_recurrent_backend_select_min_tokens
+                and cache_indices.numel() == 1
+                and query_start_loc is not None
+                and query_start_loc.numel() == 2
+            )
             with _qwen35_gdn_trace_span("_qwen35_gdncore_dispatch"):
-                core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
-                    q=query,
-                    k=key,
-                    v=value,
-                    g=g,
-                    beta=beta,
-                    ssm_states=ssm_states,
-                    cache_indices=cache_indices,
-                    query_start_loc=query_start_loc,
-                )
+                if _use_unifyinfer_qwen35_gdn_recurrent_backend_select:
+                    dispatch_extend = (
+                        self.kernel_dispatcher.extend_recurrent
+                        if use_recurrent_backend_select
+                        else self.kernel_dispatcher.extend_chunk
+                    )
+                    core_attn_out, last_recurrent_state, h = dispatch_extend(
+                        q=query,
+                        k=key,
+                        v=value,
+                        g=g,
+                        beta=beta,
+                        ssm_states=ssm_states,
+                        cache_indices=cache_indices,
+                        query_start_loc=query_start_loc,
+                        has_mamba_track_mask=has_mamba_track_mask,
+                        g_is_chunk_cumsum=use_fused_gate_cumsum,
+                    )
+                else:
+                    core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
+                        q=query,
+                        k=key,
+                        v=value,
+                        g=g,
+                        beta=beta,
+                        ssm_states=ssm_states,
+                        cache_indices=cache_indices,
+                        query_start_loc=query_start_loc,
+                        has_mamba_track_mask=has_mamba_track_mask,
+                        g_is_chunk_cumsum=use_fused_gate_cumsum,
+                    )
 
             if (is_npu() or is_cpu()) and last_recurrent_state is not None:
                 last_recurrent_state = last_recurrent_state.to(

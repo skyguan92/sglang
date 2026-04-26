@@ -73,6 +73,10 @@ _use_qwen35_pretransposed_out_proj = (
 _use_qwen35_pretransposed_220_large_proj = (
     get_bool_env_var("UNIFYINFER_QWEN35_PRETRANSPOSED_220_LARGE_PROJ") and _is_hip
 )
+_use_qwen35_pretransposed_large_proj_window = (
+    get_bool_env_var("UNIFYINFER_QWEN35_PRETRANSPOSED_LARGE_PROJ_WINDOW")
+    and _is_hip
+)
 _use_qwen35_hipb_explicit_208_attn_qkv = (
     get_bool_env_var("UNIFYINFER_QWEN35_HIPB_EXPLICIT_208_ATTN_QKV") and _is_hip
 )
@@ -187,6 +191,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 _use_qwen35_pretransposed_220_large_proj
                 and _is_qwen35_large_projection_weight(layer.weight)
             )
+            or (
+                _use_qwen35_pretransposed_large_proj_window
+                and _is_qwen35_large_projection_weight(layer.weight)
+            )
         ):
             layer._unifyinfer_qwen35_out_proj_weight_t = (
                 layer.weight.data.t().contiguous()
@@ -228,11 +236,19 @@ class UnquantizedLinearMethod(LinearMethodBase):
             return output
 
         elif (
-            _use_qwen35_pretransposed_220_large_proj
-            and _is_qwen35_large_projection_weight(layer.weight)
-            and x.ndim == 2
-            and x.shape[0] == 220
-            and x.shape[1] == 2048
+            (
+                _use_qwen35_pretransposed_220_large_proj
+                and _is_qwen35_large_projection_weight(layer.weight)
+                and x.ndim == 2
+                and x.shape[0] == 220
+                and x.shape[1] == 2048
+            )
+            or (
+                _use_qwen35_pretransposed_large_proj_window
+                and _should_use_qwen35_pretransposed_large_proj_window(
+                    x, layer.weight
+                )
+            )
         ):
             weight_t = getattr(layer, "_unifyinfer_qwen35_out_proj_weight_t", None)
             if weight_t is None or weight_t.device != layer.weight.device:
@@ -297,6 +313,25 @@ def _is_qwen35_large_projection_weight(weight: torch.Tensor) -> bool:
     if weight.ndim != 2:
         return False
     return weight.shape[1] == 2048 and weight.shape[0] in (12288, 9216)
+
+
+def _should_use_qwen35_pretransposed_large_proj_window(
+    x: torch.Tensor, weight: torch.Tensor
+) -> bool:
+    if x.ndim != 2 or weight.ndim != 2:
+        return False
+    if x.shape[1] != 2048 or weight.shape[1] != 2048:
+        return False
+    m = x.shape[0]
+    n = weight.shape[0]
+    # `rS15ey` found cached pretransposed `torch.mm` is positive for the GDN
+    # 12288 projection over this whole screened window, while 9216 should avoid
+    # the low-M 160/192 points.
+    if n == 12288:
+        return m in (160, 192, 208, 220, 224, 240, 256)
+    if n == 9216:
+        return m in (208, 220, 224, 240, 256)
+    return False
 
 
 def _maybe_get_qwen35_hipb_explicit_solution_id(

@@ -3,18 +3,22 @@ import torch
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
-from sglang.srt.utils import is_cpu, is_npu
+from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_cpu, is_npu
 
-if not is_cpu():
+_is_cpu = is_cpu()
+_is_npu = is_npu()
+
+if not _is_cpu:
     from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
     from sglang.srt.layers.attention.fla.fused_recurrent import (
+        fused_recurrent_gated_delta_rule_update,
         fused_recurrent_gated_delta_rule_packed_decode,
     )
     from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
         fused_sigmoid_gating_delta_rule_update,
     )
 
-if is_npu():
+if _is_npu:
     from sgl_kernel_npu.fla.chunk import chunk_gated_delta_rule_npu
     from sgl_kernel_npu.fla.fused_sigmoid_gating_recurrent import (
         fused_sigmoid_gating_delta_rule_update_npu,
@@ -22,7 +26,7 @@ if is_npu():
 
     chunk_gated_delta_rule = chunk_gated_delta_rule_npu
     fused_sigmoid_gating_delta_rule_update = fused_sigmoid_gating_delta_rule_update_npu
-elif is_cpu():
+elif _is_cpu:
     from sgl_kernel.mamba import chunk_gated_delta_rule_cpu
 
     chunk_gated_delta_rule = chunk_gated_delta_rule_cpu
@@ -30,11 +34,70 @@ elif is_cpu():
         torch.ops.sgl_kernel.fused_sigmoid_gating_delta_rule_update_cpu
     )
 
+_use_unifyinfer_qwen35_gdn_recurrent_extend = get_bool_env_var(
+    "UNIFYINFER_QWEN35_GDN_RECURRENT_EXTEND"
+)
+_unifyinfer_qwen35_gdn_recurrent_extend_min_tokens = get_int_env_var(
+    "UNIFYINFER_QWEN35_GDN_RECURRENT_EXTEND_MIN_TOKENS"
+)
+_unifyinfer_qwen35_gdn_recurrent_trace_shape = get_bool_env_var(
+    "UNIFYINFER_QWEN35_GDN_RECURRENT_TRACE_SHAPE"
+)
+_unifyinfer_qwen35_gdn_recurrent_trace_shape_limit = get_int_env_var(
+    "UNIFYINFER_QWEN35_GDN_RECURRENT_TRACE_SHAPE_LIMIT", 16
+)
+_unifyinfer_qwen35_gdn_recurrent_trace_shape_count = 0
+
+
+def _maybe_trace_recurrent_extend_shape(
+    *,
+    branch: str,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    cache_indices: torch.Tensor,
+    query_start_loc: torch.Tensor | None,
+    has_mamba_track_mask: bool,
+) -> None:
+    global _unifyinfer_qwen35_gdn_recurrent_trace_shape_count
+    if not _unifyinfer_qwen35_gdn_recurrent_trace_shape:
+        return
+    if (
+        _unifyinfer_qwen35_gdn_recurrent_trace_shape_count
+        >= _unifyinfer_qwen35_gdn_recurrent_trace_shape_limit
+    ):
+        return
+    _unifyinfer_qwen35_gdn_recurrent_trace_shape_count += 1
+
+    query_start_loc_preview = None
+    if query_start_loc is not None:
+        query_start_loc_preview = query_start_loc.detach().cpu().tolist()[:8]
+    cache_indices_preview = cache_indices.detach().cpu().tolist()[:8]
+    print(
+        "[unifyinfer-qwen35-gdn-recurrent-shape] "
+        f"branch={branch} "
+        f"q_shape={tuple(q.shape)} "
+        f"k_shape={tuple(k.shape)} "
+        f"v_shape={tuple(v.shape)} "
+        f"g_shape={tuple(g.shape)} "
+        f"beta_shape={tuple(beta.shape)} "
+        f"min_tokens={_unifyinfer_qwen35_gdn_recurrent_extend_min_tokens} "
+        f"cache_indices_numel={cache_indices.numel()} "
+        f"cache_indices={cache_indices_preview} "
+        f"query_start_loc_numel="
+        f"{query_start_loc.numel() if query_start_loc is not None else None} "
+        f"query_start_loc={query_start_loc_preview} "
+        f"has_mamba_track_mask={has_mamba_track_mask}",
+        flush=True,
+    )
+
 
 class TritonGDNKernel(LinearAttnKernelBase):
     """Triton-based kernel for GDN (Gated Delta Network) linear attention."""
 
-    supports_packed_decode: bool = not is_cpu() and not is_npu()
+    supports_packed_decode: bool = not _is_cpu and not _is_npu
 
     def packed_decode(
         self,
@@ -135,9 +198,101 @@ class TritonGDNKernel(LinearAttnKernelBase):
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> tuple:
+        use_recurrent_extend = False
+        has_mamba_track_mask = False
+        if (
+            _use_unifyinfer_qwen35_gdn_recurrent_extend
+            and q.shape[1] >= _unifyinfer_qwen35_gdn_recurrent_extend_min_tokens
+        ):
+            has_mamba_track_mask = kwargs.get("has_mamba_track_mask", False)
+            use_recurrent_extend = (
+                not (_is_cpu or _is_npu)
+                and not has_mamba_track_mask
+                and q.shape[0] == 1
+                and cache_indices.numel() == 1
+                and query_start_loc is not None
+                and query_start_loc.numel() == 2
+            )
+        elif _unifyinfer_qwen35_gdn_recurrent_trace_shape:
+            has_mamba_track_mask = kwargs.get("has_mamba_track_mask", False)
+
+        if _unifyinfer_qwen35_gdn_recurrent_trace_shape:
+            _maybe_trace_recurrent_extend_shape(
+                branch="recurrent" if use_recurrent_extend else "chunk",
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                has_mamba_track_mask=has_mamba_track_mask,
+            )
+        if use_recurrent_extend:
+            return self.extend_recurrent(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+            )
+
+        return self.extend_chunk(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            g_is_chunk_cumsum=kwargs.get("g_is_chunk_cumsum", False),
+        )
+
+    def extend_recurrent(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        *,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        **kwargs,
+    ) -> tuple:
+        out = fused_recurrent_gated_delta_rule_update(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            scale=k.shape[-1] ** -0.5,
+            initial_state_source=ssm_states,
+            initial_state_indices=cache_indices,
+            cu_seqlens=None,
+            use_qk_l2norm_in_kernel=True,
+        )
+        return out, None, None
+
+    def extend_chunk(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        *,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        **kwargs,
+    ) -> tuple:
         recurrent_state = ssm_states
         recurrent_state_indices_args = {"initial_state_indices": cache_indices}
-        if is_npu() or is_cpu():
+        if _is_npu or _is_cpu:
             recurrent_state = ssm_states[cache_indices]
             recurrent_state_indices_args = {}
         return chunk_gated_delta_rule(
@@ -150,6 +305,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             cu_seqlens=query_start_loc,
             head_first=False,
             use_qk_l2norm_in_kernel=True,
+            g_is_chunk_cumsum=kwargs.get("g_is_chunk_cumsum", False),
             **recurrent_state_indices_args,
         )
 

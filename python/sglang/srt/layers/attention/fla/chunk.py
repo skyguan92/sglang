@@ -20,8 +20,29 @@ from sglang.srt.layers.attention.fla.utils import (
     autocast_custom_fwd,
     input_guard,
 )
+from sglang.srt.utils import get_bool_env_var
 
 CHUNK_SIZE = 64
+_use_unifyinfer_qwen35_fla_direct_extend_noautograd = get_bool_env_var(
+    "UNIFYINFER_QWEN35_FLA_DIRECT_EXTEND_NOAUTOGRAD"
+)
+_use_unifyinfer_qwen35_fla_shared_chunk_indices = get_bool_env_var(
+    "UNIFYINFER_QWEN35_FLA_SHARED_CHUNK_INDICES"
+)
+_use_unifyinfer_qwen35_fla_single_seq_novarlen_extend = get_bool_env_var(
+    "UNIFYINFER_QWEN35_FLA_SINGLE_SEQ_NOVARLEN_EXTEND"
+)
+
+
+def _should_use_single_seq_novarlen(
+    q: torch.Tensor,
+    cu_seqlens: Optional[torch.LongTensor],
+) -> bool:
+    return (
+        cu_seqlens is not None
+        and q.shape[0] == 1
+        and cu_seqlens.numel() == 2
+    )
 
 
 def chunk_gated_delta_rule_fwd(
@@ -35,8 +56,22 @@ def chunk_gated_delta_rule_fwd(
     initial_state_indices: torch.Tensor,
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_indices: torch.LongTensor | None = None,
+    share_chunk_indices: bool = False,
+    g_is_chunk_cumsum: bool = False,
 ):
-    g = chunk_local_cumsum(g, chunk_size=CHUNK_SIZE, cu_seqlens=cu_seqlens)
+    shared_chunk_indices = chunk_indices if share_chunk_indices else None
+    # chunk_fwd_o may shrink BT below CHUNK_SIZE for short decode shapes.
+    # Only reuse CHUNK_SIZE indices when the o-kernel uses the same chunking.
+    shared_chunk_indices_for_o = (
+        shared_chunk_indices if q.shape[1] >= CHUNK_SIZE else None
+    )
+    if not g_is_chunk_cumsum:
+        g = chunk_local_cumsum(
+            g,
+            chunk_size=CHUNK_SIZE,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=shared_chunk_indices,
+        )
 
     # fused kkt + solve_tril + recompute_w_u
     w, u, A = chunk_gated_delta_rule_fwd_intra(
@@ -56,6 +91,7 @@ def chunk_gated_delta_rule_fwd(
         initial_state=initial_state,
         initial_state_indices=initial_state_indices,
         cu_seqlens=cu_seqlens,
+        chunk_indices=shared_chunk_indices,
     )
     o = chunk_fwd_o(
         q=q,
@@ -65,6 +101,7 @@ def chunk_gated_delta_rule_fwd(
         g=g,
         scale=scale,
         cu_seqlens=cu_seqlens,
+        chunk_indices=shared_chunk_indices_for_o,
     )
     if SUPPRESS_LEVEL < 3:
         return g, o, A, None, h, None
@@ -117,6 +154,55 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         return o.to(q.dtype), h
 
 
+@input_guard
+def chunk_gated_delta_rule_direct_noautograd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float,
+    initial_state: torch.Tensor,
+    initial_state_indices: torch.Tensor,
+    cu_seqlens: Optional[torch.LongTensor] = None,
+    use_qk_l2norm_in_kernel: bool = False,
+    g_is_chunk_cumsum: bool = False,
+):
+    source_dtype = q.dtype
+    if use_qk_l2norm_in_kernel:
+        q = l2norm_fwd(q)
+        k = l2norm_fwd(k)
+
+    effective_cu_seqlens = cu_seqlens
+    if _use_unifyinfer_qwen35_fla_single_seq_novarlen_extend and _should_use_single_seq_novarlen(
+        q, cu_seqlens
+    ):
+        effective_cu_seqlens = None
+    if g_is_chunk_cumsum and effective_cu_seqlens is not None:
+        raise ValueError("pre-cumulative GDN gate requires non-varlen extend")
+
+    chunk_indices = (
+        prepare_chunk_indices(effective_cu_seqlens, CHUNK_SIZE)
+        if effective_cu_seqlens is not None
+        else None
+    )
+    _, o, _, _, h, _ = chunk_gated_delta_rule_fwd(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        scale=scale,
+        initial_state=initial_state,
+        initial_state_indices=initial_state_indices,
+        cu_seqlens=effective_cu_seqlens,
+        chunk_indices=chunk_indices,
+        share_chunk_indices=_use_unifyinfer_qwen35_fla_shared_chunk_indices,
+        g_is_chunk_cumsum=g_is_chunk_cumsum,
+    )
+    return o.to(source_dtype), h
+
+
 @torch.compiler.disable
 def chunk_gated_delta_rule(
     q: torch.Tensor,
@@ -130,6 +216,7 @@ def chunk_gated_delta_rule(
     cu_seqlens: Optional[torch.LongTensor] = None,
     head_first: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
+    g_is_chunk_cumsum: bool = False,
 ):
     r"""
     Args:
@@ -233,18 +320,37 @@ def chunk_gated_delta_rule(
             )
     if scale is None:
         scale = k.shape[-1] ** -0.5
-    o, h = ChunkGatedDeltaRuleFunction.apply(
-        q,
-        k,
-        v,
-        g,
-        beta,
-        scale,
-        initial_state,
-        initial_state_indices,
-        cu_seqlens,
-        use_qk_l2norm_in_kernel,
-    )
+    if _use_unifyinfer_qwen35_fla_direct_extend_noautograd:
+        o, h = chunk_gated_delta_rule_direct_noautograd(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            scale=scale,
+            initial_state=initial_state,
+            initial_state_indices=initial_state_indices,
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            g_is_chunk_cumsum=g_is_chunk_cumsum,
+        )
+    else:
+        if g_is_chunk_cumsum:
+            raise ValueError(
+                "pre-cumulative GDN gate requires direct no-autograd extend"
+            )
+        o, h = ChunkGatedDeltaRuleFunction.apply(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale,
+            initial_state,
+            initial_state_indices,
+            cu_seqlens,
+            use_qk_l2norm_in_kernel,
+        )
     if head_first:
         o = rearrange(o, "b t h ... -> b h t ...")
     return o, None, h

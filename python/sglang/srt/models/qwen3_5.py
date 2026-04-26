@@ -15,6 +15,7 @@
 """Inference-only Qwen3.5 model and Qwen3.5 MoE model compatible with HuggingFace weights."""
 
 import logging
+import os
 from contextlib import nullcontext
 from functools import lru_cache
 from typing import Iterable, Optional, Set, Tuple, Union
@@ -41,6 +42,9 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 
 # Layers - Attention
+from sglang.srt.layers.attention.fla.fused_norm_gate import (
+    rms_norm_gated as fused_rms_norm_gated,
+)
 from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
@@ -106,6 +110,52 @@ _is_cpu = is_cpu()
 _is_gfx95 = is_gfx95_supported()
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_disable_qwen35_attn_output_gate = get_bool_env_var(
+    "UNIFYINFER_QWEN35_DISABLE_ATTN_OUTPUT_GATE"
+)
+
+
+def _parse_layer_id_set(value: Optional[str]) -> Set[int]:
+    if not value:
+        return set()
+
+    layer_ids: Set[int] = set()
+    for raw_part in value.replace(";", ",").split(","):
+        part = raw_part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start_s, end_s = part.split("-", 1)
+            start = int(start_s.strip())
+            end = int(end_s.strip())
+            if end < start:
+                raise ValueError(f"Invalid descending layer range: {part}")
+            layer_ids.update(range(start, end + 1))
+        else:
+            layer_ids.add(int(part))
+    return layer_ids
+
+
+_disable_qwen35_attn_output_gate_layers = _parse_layer_id_set(
+    os.environ.get("UNIFYINFER_QWEN35_DISABLE_ATTN_OUTPUT_GATE_LAYERS")
+)
+_enable_qwen35_attn_output_gate_layers = _parse_layer_id_set(
+    os.environ.get("UNIFYINFER_QWEN35_ENABLE_ATTN_OUTPUT_GATE_LAYERS")
+)
+
+
+def _should_use_qwen35_attn_output_gate(layer_id: int, default_enabled: bool) -> bool:
+    if not default_enabled:
+        return False
+    if layer_id in _enable_qwen35_attn_output_gate_layers:
+        return True
+    if _disable_qwen35_attn_output_gate:
+        return False
+    if layer_id in _disable_qwen35_attn_output_gate_layers:
+        return False
+    return True
+
+
 _use_unifyinfer_qwen35_hip_alt_stream = (
     get_bool_env_var("UNIFYINFER_QWEN35_HIP_ALT_STREAM") and _is_hip
 )
@@ -141,6 +191,13 @@ _use_unifyinfer_qwen35_hip_alt_stream_gdn_input_proj_decode_only = (
     get_bool_env_var("UNIFYINFER_QWEN35_HIP_ALT_STREAM_GDN_INPUT_PROJ_DECODE_ONLY")
     and _is_hip
 )
+_use_unifyinfer_qwen35_attn_gate_alt_stream = (
+    get_bool_env_var("UNIFYINFER_QWEN35_ATTN_GATE_ALT_STREAM") and _is_hip
+)
+_use_unifyinfer_qwen35_attn_gate_alt_stream_prefill_only = (
+    get_bool_env_var("UNIFYINFER_QWEN35_ATTN_GATE_ALT_STREAM_PREFILL_ONLY")
+    and _is_hip
+)
 _use_unifyinfer_qwen35_shared_expert_fusion = (
     get_bool_env_var("UNIFYINFER_QWEN35_SHARED_EXPERT_FUSION") and _is_hip
 )
@@ -150,6 +207,14 @@ _use_unifyinfer_qwen35_shared_expert_fusion_prefill_only = (
 )
 _use_unifyinfer_qwen35_gdn_fused_proj = not get_bool_env_var(
     "UNIFYINFER_DISABLE_QWEN35_GDN_FUSED_PROJ"
+)
+_use_unifyinfer_qwen35_fused_rmsnorm_gated = (
+    get_bool_env_var("UNIFYINFER_QWEN35_FUSED_RMSNORM_GATED")
+    and not (_is_cpu or _is_npu)
+)
+_use_unifyinfer_qwen35_fused_rmsnorm_gated_prefill_only = (
+    get_bool_env_var("UNIFYINFER_QWEN35_FUSED_RMSNORM_GATED_PREFILL_ONLY")
+    and not (_is_cpu or _is_npu)
 )
 _use_unifyinfer_qwen35_trace_attn_split = get_bool_env_var(
     "UNIFYINFER_QWEN35_TRACE_ATTN_SPLIT"
@@ -172,10 +237,30 @@ def _should_use_unifyinfer_qwen35_hip_alt_stream_component(
     return forward_batch is not None and forward_batch.forward_mode.is_decode()
 
 
+def _should_use_unifyinfer_qwen35_attn_gate_alt_stream(
+    forward_batch: Optional[ForwardBatch],
+) -> bool:
+    if _use_unifyinfer_qwen35_attn_gate_alt_stream:
+        return True
+    if not _use_unifyinfer_qwen35_attn_gate_alt_stream_prefill_only:
+        return False
+    return forward_batch is not None and not forward_batch.forward_mode.is_decode()
+
+
 def _qwen35_trace_span(name: str):
     if not _use_unifyinfer_qwen35_trace_attn_split:
         return nullcontext()
     return record_function(name)
+
+
+def _should_use_unifyinfer_qwen35_fused_rmsnorm_gated(
+    forward_batch: Optional[ForwardBatch],
+) -> bool:
+    if _use_unifyinfer_qwen35_fused_rmsnorm_gated:
+        return True
+    if not _use_unifyinfer_qwen35_fused_rmsnorm_gated_prefill_only:
+        return False
+    return forward_batch is not None and not forward_batch.forward_mode.is_decode()
 
 
 class Qwen3_5GatedDeltaNet(nn.Module):
@@ -598,7 +683,17 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
                 core_attn_out = core_attn_out_pad
 
-            core_attn_out = self.norm(core_attn_out, z)
+            if _should_use_unifyinfer_qwen35_fused_rmsnorm_gated(forward_batch):
+                core_attn_out = fused_rms_norm_gated(
+                    core_attn_out,
+                    z,
+                    self.norm.weight,
+                    None,
+                    activation=self.activation,
+                    eps=self.layer_norm_epsilon,
+                )
+            else:
+                core_attn_out = self.norm(core_attn_out, z)
             core_attn_out = core_attn_out.reshape(z_shape_og)
             core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
 
@@ -781,7 +876,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         if rope_scaling and not ("rope_type" in rope_scaling or "type" in rope_scaling):
             rope_scaling = None
 
-        self.attn_output_gate = getattr(config, "attn_output_gate", True)
+        self.attn_output_gate = _should_use_qwen35_attn_output_gate(
+            layer_id, getattr(config, "attn_output_gate", True)
+        )
         if self.attn_output_gate:
             logger.warning_once("using attn output gate!")
 
@@ -933,6 +1030,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         with _qwen35_trace_span("_qwen35_attnsplit_proj"):
             qkv, _ = self.qkv_proj(hidden_states)
 
+        gate_sigmoid: Optional[torch.Tensor] = None
+        gate_alt_stream_used = False
         if self.attn_output_gate:
             with _qwen35_trace_span("_qwen35_attnsplit_split"):
                 q_gate, k, v = qkv.split(
@@ -943,6 +1042,17 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 q, gate = torch.chunk(q_gate, 2, dim=-1)
                 q = q.reshape(*orig_shape, -1)
                 gate = gate.reshape(*orig_shape, -1)
+                if (
+                    self.alt_stream is not None
+                    and _should_use_unifyinfer_qwen35_attn_gate_alt_stream(
+                        forward_batch
+                    )
+                ):
+                    current_stream = torch.cuda.current_stream()
+                    self.alt_stream.wait_stream(current_stream)
+                    with torch.cuda.stream(self.alt_stream):
+                        gate_sigmoid = torch.sigmoid(gate)
+                    gate_alt_stream_used = True
         else:
             with _qwen35_trace_span("_qwen35_attnsplit_split"):
                 q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -956,8 +1066,13 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
         if self.attn_output_gate:
             with _qwen35_trace_span("_qwen35_attnsplit_gateapply"):
-                gate = torch.sigmoid(gate)
-                attn_output = attn_output * gate
+                if gate_alt_stream_used:
+                    assert gate_sigmoid is not None
+                    torch.cuda.current_stream().wait_stream(self.alt_stream)
+                    attn_output = attn_output * gate_sigmoid
+                else:
+                    gate = torch.sigmoid(gate)
+                    attn_output = attn_output * gate
 
         with _qwen35_trace_span("_qwen35_attnsplit_outproj"):
             output, _ = self.o_proj(attn_output)
@@ -1057,6 +1172,8 @@ class Qwen3_5ForCausalLM(nn.Module):
             or _use_unifyinfer_qwen35_hip_alt_stream_shared_expert
             or _use_unifyinfer_qwen35_hip_alt_stream_qk_norm
             or _use_unifyinfer_qwen35_hip_alt_stream_gdn_input_proj
+            or _use_unifyinfer_qwen35_attn_gate_alt_stream
+            or _use_unifyinfer_qwen35_attn_gate_alt_stream_prefill_only
         ) else None
 
         # Embedding layer

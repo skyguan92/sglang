@@ -21,6 +21,12 @@ _use_unifyinfer_qwen35_fla_dispatch_alt = get_bool_env_var(
 _use_unifyinfer_qwen35_fla_chunk_o_alt = get_bool_env_var(
     "UNIFYINFER_QWEN35_FLA_CHUNK_O_ALT"
 )
+_use_unifyinfer_qwen35_fla_chunk_o_warps8_alt = get_bool_env_var(
+    "UNIFYINFER_QWEN35_FLA_CHUNK_O_WARPS8_ALT"
+)
+_use_unifyinfer_qwen35_fla_chunk_o_empty_output_alt = get_bool_env_var(
+    "UNIFYINFER_QWEN35_FLA_CHUNK_O_EMPTY_OUTPUT_ALT"
+)
 
 
 # @triton.autotune(
@@ -139,19 +145,31 @@ def chunk_fwd_o(
     scale: Optional[float] = None,
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_size: int = 64,
+    chunk_indices: Optional[torch.LongTensor] = None,
 ) -> torch.Tensor:
     B, T, Hg, K, V = *q.shape, v.shape[-1]
     H = v.shape[-2]
     BT = min(chunk_size, max(16, triton.next_power_of_2(T)))
-    chunk_indices = (
-        prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
-    )
+    if chunk_indices is None and cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     if scale is None:
         scale = k.shape[-1] ** -0.5
 
-    o = torch.zeros_like(v)
-    if _use_unifyinfer_qwen35_fla_dispatch_alt or _use_unifyinfer_qwen35_fla_chunk_o_alt:
+    # The o-kernel covers every valid output element for qwen3.5 prompt/extend
+    # shapes, so this opt-in probe avoids a redundant device memset.
+    o = (
+        torch.empty_like(v)
+        if _use_unifyinfer_qwen35_fla_chunk_o_empty_output_alt
+        else torch.zeros_like(v)
+    )
+    if _use_unifyinfer_qwen35_fla_chunk_o_warps8_alt:
+        # ROCm synthetic screen D207 winner; keep opt-in until live A/B proves it.
+        cfg = {"BK": 64, "BV": 64, "num_warps": 8, "num_stages": 3}
+    elif (
+        _use_unifyinfer_qwen35_fla_dispatch_alt
+        or _use_unifyinfer_qwen35_fla_chunk_o_alt
+    ):
         # Bounded ROCm probe taken from the dormant autotune search space.
         cfg = {"BK": 64, "BV": 64, "num_warps": 2, "num_stages": 3}
     else:

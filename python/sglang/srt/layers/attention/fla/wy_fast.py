@@ -9,6 +9,11 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.attention.fla.index import prepare_chunk_indices
+from sglang.srt.utils import get_bool_env_var
+
+_use_unifyinfer_qwen35_fla_recompute_wu_warps2_alt = get_bool_env_var(
+    "UNIFYINFER_QWEN35_FLA_RECOMPUTE_WU_WARPS2_ALT"
+)
 
 
 # @triton.autotune(
@@ -128,6 +133,7 @@ def recompute_w_u_fwd(
     BV = 64
     u = torch.empty_like(v)
     w = k.new_empty(B, T, H, K)
+    num_warps = 2 if _use_unifyinfer_qwen35_fla_recompute_wu_warps2_alt else 4
     recompute_w_u_fwd_kernel[(NT, B * H)](
         k=k,
         v=v,
@@ -147,7 +153,7 @@ def recompute_w_u_fwd(
         BK=BK,
         BV=BV,
         IS_VARLEN=cu_seqlens is not None,
-        num_warps=4,
+        num_warps=num_warps,
         num_stages=3,
     )
     return w, u

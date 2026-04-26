@@ -34,7 +34,10 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.eplb.expert_location import (
+    ModelConfigForExpertLocation,
+    get_global_expert_location_metadata,
+)
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
@@ -395,6 +398,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         shared_logits = shared_out[0] if isinstance(shared_out, tuple) else shared_out
         return F.sigmoid(shared_logits)
 
+    def _expert_location_dispatch_info(self) -> Optional[ExpertLocationDispatchInfo]:
+        if self.is_nextn or get_global_expert_location_metadata() is None:
+            return None
+        return ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
+
     def _append_shared_to_topk_output(
         self,
         topk_output: StandardTopKOutput,
@@ -474,13 +482,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 hidden_states,
                 router_logits,
                 num_token_non_padded=forward_batch.num_token_non_padded,
-                expert_location_dispatch_info=(
-                    ExpertLocationDispatchInfo.init_new(
-                        layer_id=self.layer_id,
-                    )
-                    if not self.is_nextn
-                    else None
-                ),
+                expert_location_dispatch_info=self._expert_location_dispatch_info(),
             )
             if use_fused_shared_expert and TopKOutputChecker.format_is_standard(
                 topk_output
@@ -507,7 +509,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     ):
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
+        topk_output = self.topk(
+            hidden_states,
+            router_logits,
+            expert_location_dispatch_info=self._expert_location_dispatch_info(),
+        )
         if self.enable_shared_expert_fusion and TopKOutputChecker.format_is_standard(
             topk_output
         ):

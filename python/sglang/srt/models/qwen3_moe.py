@@ -39,7 +39,10 @@ from sglang.srt.distributed import (
     moe_tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.eplb.expert_location import (
+    ModelConfigForExpertLocation,
+    get_global_expert_location_metadata,
+)
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
@@ -323,6 +326,11 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             )
         ]
 
+    def _expert_location_dispatch_info(self) -> Optional[ExpertLocationDispatchInfo]:
+        if get_global_expert_location_metadata() is None:
+            return None
+        return ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
+
     def forward_normal(
         self,
         hidden_states: torch.Tensor,
@@ -334,7 +342,11 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
+        topk_output = self.topk(
+            hidden_states,
+            router_logits,
+            expert_location_dispatch_info=self._expert_location_dispatch_info(),
+        )
         final_hidden_states = self.experts(hidden_states, topk_output)
 
         if self.ep_size > 1 and not should_allreduce_fusion:
@@ -362,9 +374,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 hidden_states,
                 router_logits,
                 num_token_non_padded=forward_batch.num_token_non_padded,
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
-                ),
+                expert_location_dispatch_info=self._expert_location_dispatch_info(),
             )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
@@ -394,9 +404,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                     hidden_states=hidden_states,
                     router_logits=router_logits,
                     num_token_non_padded=state.forward_batch.num_token_non_padded,
-                    expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                        layer_id=self.layer_id,
-                    ),
+                    expert_location_dispatch_info=self._expert_location_dispatch_info(),
                 )
         else:
             state.topk_output = self.topk.empty_topk_output(hidden_states.device)

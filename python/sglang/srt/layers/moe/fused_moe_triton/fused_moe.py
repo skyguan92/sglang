@@ -68,11 +68,21 @@ _use_unifyinfer_mixed_tail_w13_direct_io = (
 _use_unifyinfer_sorted_prepacked_w13 = (
     get_bool_env_var("UNIFYINFER_EXPERIMENTAL_MOE_SORTED_PREPACKED_W13") and _is_hip
 )
+_unifyinfer_sorted_prepacked_w13_min_tokens = (
+    get_int_env_var("UNIFYINFER_EXPERIMENTAL_MOE_SORTED_PREPACKED_W13_MIN_TOKENS", 0)
+    if _is_hip
+    else 0
+)
 _use_unifyinfer_device_tail_block_w13 = (
     get_bool_env_var("UNIFYINFER_EXPERIMENTAL_MOE_DEVICE_TAIL_BLOCK_W13") and _is_hip
 )
 _unifyinfer_device_tail_block_w13_min_padded_assignments = (
     get_int_env_var("UNIFYINFER_EXPERIMENTAL_MOE_DEVICE_TAIL_BLOCK_W13_MIN_PADDED_ASSIGNMENTS", 0)
+    if _is_hip
+    else 0
+)
+_unifyinfer_device_tail_block_w13_min_tokens = (
+    get_int_env_var("UNIFYINFER_EXPERIMENTAL_MOE_DEVICE_TAIL_BLOCK_W13_MIN_TOKENS", 0)
     if _is_hip
     else 0
 )
@@ -660,6 +670,7 @@ def _counted_tail_block_prepacked_direct_io_kernel(
     stride_cm,
     stride_cn,
     BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_M_LOGICAL: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     APPLY_ROUTER_WEIGHT: tl.constexpr,
@@ -675,15 +686,15 @@ def _counted_tail_block_prepacked_direct_io_kernel(
         return
 
     block_id = tl.load(tail_block_ids_ptr + pid_tail_block).to(tl.int64)
-    block_start = block_id * BLOCK_SIZE_M
+    block_start = block_id * BLOCK_SIZE_M_LOGICAL
     expert_id = tl.load(expert_ids_ptr + block_id).to(tl.int64)
     offs_m = tl.arange(0, BLOCK_SIZE_M)
     assignment_ids = tl.load(
         sorted_token_ids_ptr + block_start + offs_m,
-        mask=offs_m < BLOCK_SIZE_M,
+        mask=offs_m < BLOCK_SIZE_M_LOGICAL,
         other=num_valid_tokens,
     ).to(tl.int64)
-    token_mask = assignment_ids < num_valid_tokens
+    token_mask = (offs_m < BLOCK_SIZE_M_LOGICAL) & (assignment_ids < num_valid_tokens)
     offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
 
     if FILTER_EXPERT and expert_id == -1:
@@ -899,6 +910,11 @@ def _should_use_unifyinfer_sorted_prepacked_w13(
     a1_scale: Optional[torch.Tensor],
     block_shape: Optional[List[int]],
 ) -> bool:
+    if (
+        _unifyinfer_sorted_prepacked_w13_min_tokens > 0
+        and int(hidden_states.shape[0]) < _unifyinfer_sorted_prepacked_w13_min_tokens
+    ):
+        return False
     return (
         _use_unifyinfer_sorted_prepacked_w13
         and _is_unifyinfer_single_storage_w13_alias(w1, w1_prepacked)
@@ -933,6 +949,11 @@ def _should_use_unifyinfer_device_tail_block_w13(
     sorted_token_ids: torch.Tensor,
     topk_ids: torch.Tensor,
 ) -> bool:
+    if (
+        _unifyinfer_device_tail_block_w13_min_tokens > 0
+        and int(hidden_states.shape[0]) < _unifyinfer_device_tail_block_w13_min_tokens
+    ):
+        return False
     padded_assignments = int(sorted_token_ids.numel()) - int(topk_ids.numel())
     if (
         _unifyinfer_device_tail_block_w13_min_padded_assignments > 0
@@ -1087,6 +1108,7 @@ def _invoke_unifyinfer_device_tail_block_w13(
     max_tail_blocks = int(expert_ids.numel())
     if max_tail_blocks <= 0:
         return
+    tail_block_size_m = 1 << (block_size_m - 1).bit_length()
 
     tail_block_ids = torch.empty(
         (max_tail_blocks,),
@@ -1135,7 +1157,8 @@ def _invoke_unifyinfer_device_tail_block_w13(
         w1_prepacked.stride(1),
         intermediate_cache1.stride(0),
         intermediate_cache1.stride(1),
-        BLOCK_SIZE_M=block_size_m,
+        BLOCK_SIZE_M=tail_block_size_m,
+        BLOCK_SIZE_M_LOGICAL=block_size_m,
         BLOCK_SIZE_N=block_size_n,
         BLOCK_SIZE_K=block_size_k,
         APPLY_ROUTER_WEIGHT=mul_routed_weight,
