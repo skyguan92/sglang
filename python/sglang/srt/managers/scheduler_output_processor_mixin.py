@@ -122,6 +122,69 @@ class SchedulerOutputProcessorMixin:
                     elem = elem.copy()
                 req.customized_info[k].append(elem)
 
+    def _unifyinfer_phase25_target_trace_exporter(self):
+        if hasattr(self, "_unifyinfer_phase25_target_trace_exporter"):
+            return self._unifyinfer_phase25_target_trace_exporter
+
+        try:
+            from unifyinfer.traces.sglang_target_event_export import (
+                TargetOnlyTraceExporter,
+            )
+
+            exporter = TargetOnlyTraceExporter.from_env()
+        except Exception as exc:
+            logger.warning(
+                "Failed to initialize UnifyInfer Phase 2.5 target trace exporter: %s",
+                exc,
+            )
+            exporter = None
+
+        self._unifyinfer_phase25_target_trace_exporter = exporter
+        return exporter
+
+    def _unifyinfer_phase25_observe_prefill(self, req: Req):
+        exporter = self._unifyinfer_phase25_target_trace_exporter()
+        if exporter is None or not getattr(exporter, "enabled", False):
+            return
+
+        try:
+            from unifyinfer.traces.sglang_target_event_export import (
+                observe_prefill_request,
+            )
+
+            observe_prefill_request(exporter, req)
+        except Exception as exc:
+            logger.warning(
+                "UnifyInfer Phase 2.5 target trace prefill export failed for rid=%s: %s",
+                getattr(req, "rid", None),
+                exc,
+            )
+
+    def _unifyinfer_phase25_observe_output(
+        self, req: Req, token_count: int, finished: bool
+    ):
+        exporter = self._unifyinfer_phase25_target_trace_exporter()
+        if exporter is None or not getattr(exporter, "enabled", False):
+            return
+
+        try:
+            from unifyinfer.traces.sglang_target_event_export import (
+                observe_output_request,
+            )
+
+            observe_output_request(
+                exporter,
+                req,
+                token_count=token_count,
+                finished=finished,
+            )
+        except Exception as exc:
+            logger.warning(
+                "UnifyInfer Phase 2.5 target trace output export failed for rid=%s: %s",
+                getattr(req, "rid", None),
+                exc,
+            )
+
     def process_batch_result_prefill(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -184,6 +247,7 @@ class SchedulerOutputProcessorMixin:
 
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
+                    self._unifyinfer_phase25_observe_prefill(req)
 
                     self._maybe_update_reasoning_tokens(req, next_token_id)
 
@@ -1045,11 +1109,17 @@ class SchedulerOutputProcessorMixin:
 
                 # Exclude the tokens after stop condition
                 output_ids_ = req.output_ids_through_stop
+                phase25_delta_token_count = len(output_ids_[send_token_offset:])
 
                 req.send_decode_id_offset = len(decode_ids)
                 read_offsets.append(read_offset)
                 output_ids.append(output_ids_[send_token_offset:])
                 req.send_token_offset = len(output_ids_)
+                self._unifyinfer_phase25_observe_output(
+                    req,
+                    token_count=phase25_delta_token_count,
+                    finished=req.finished(),
+                )
                 skip_special_tokens.append(req.sampling_params.skip_special_tokens)
                 spaces_between_special_tokens.append(
                     req.sampling_params.spaces_between_special_tokens
