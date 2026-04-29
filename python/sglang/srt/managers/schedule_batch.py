@@ -38,6 +38,7 @@ TODO(lmzheng): ModelWorkerBatch seems a bit redundant and we consider removing i
 import copy
 import dataclasses
 import logging
+import os
 import re
 from concurrent.futures import Future
 from enum import Enum, auto
@@ -108,6 +109,28 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 MM_PAD_SHIFT_VALUE = 1_000_000
 
 logger = logging.getLogger(__name__)
+
+
+def _unifyinfer_phase25_observe_shared_prefix_borrow(req, req_to_token_pool):
+    if not os.getenv("UNIFYINFER_DFLASH_TRACE_SHARED_PREFIX_JSON"):
+        return
+
+    try:
+        from unifyinfer.traces.sglang_target_event_export import (
+            observe_shared_prefix_admitted_request,
+        )
+
+        observe_shared_prefix_admitted_request(
+            req,
+            req_to_token_pool=req_to_token_pool,
+            source="prepare_for_extend",
+        )
+    except Exception as exc:  # pragma: no cover - fail-open live hook
+        logger.warning(
+            "UnifyInfer Phase 2.5 shared-prefix borrow export failed for rid=%s: %s",
+            getattr(req, "rid", None),
+            exc,
+        )
 
 
 @lru_cache(maxsize=1)
@@ -1658,6 +1681,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
             req.req_pool_idx = req_pool_indices[i]
             assert seq_len - pre_len == req.extend_input_len
+            if pre_len > 0:
+                _unifyinfer_phase25_observe_shared_prefix_borrow(
+                    req,
+                    self.req_to_token_pool.req_to_token,
+                )
 
             req.extend_batch_idx += 1
 

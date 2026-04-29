@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -475,6 +476,27 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             )
             req.mamba_pool_idx = None
         return
+
+    if os.getenv("UNIFYINFER_DFLASH_TRACE_SHARED_PREFIX_JSON"):
+        try:
+            from unifyinfer.traces.sglang_target_event_export import (
+                observe_shared_prefix_borrow_release,
+                shared_prefix_borrow_exporter_from_env,
+            )
+
+            exporter = shared_prefix_borrow_exporter_from_env()
+            if exporter is not None and getattr(exporter, "enabled", False):
+                observe_shared_prefix_borrow_release(
+                    exporter,
+                    req,
+                    source="release_kv_cache",
+                )
+        except Exception as exc:  # pragma: no cover - fail-open live hook
+            logger.warning(
+                "UnifyInfer Phase 2.5 shared-prefix release export failed for rid=%s: %s",
+                getattr(req, "rid", None),
+                exc,
+            )
 
     tree_cache.cache_finished_req(req, is_insert=is_insert)
 

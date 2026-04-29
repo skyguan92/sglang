@@ -142,6 +142,26 @@ class SchedulerOutputProcessorMixin:
         self._unifyinfer_phase25_target_trace_exporter_instance = exporter
         return exporter
 
+    def _unifyinfer_phase25_shared_prefix_exporter(self):
+        if hasattr(self, "_unifyinfer_phase25_shared_prefix_exporter_instance"):
+            return self._unifyinfer_phase25_shared_prefix_exporter_instance
+
+        try:
+            from unifyinfer.traces.sglang_target_event_export import (
+                shared_prefix_borrow_exporter_from_env,
+            )
+
+            exporter = shared_prefix_borrow_exporter_from_env()
+        except Exception as exc:
+            logger.warning(
+                "Failed to initialize UnifyInfer Phase 2.5 shared-prefix exporter: %s",
+                exc,
+            )
+            exporter = None
+
+        self._unifyinfer_phase25_shared_prefix_exporter_instance = exporter
+        return exporter
+
     def _unifyinfer_phase25_observe_prefill(self, req: Req):
         exporter = self._unifyinfer_phase25_target_trace_exporter()
         if exporter is None or not getattr(exporter, "enabled", False):
@@ -181,6 +201,71 @@ class SchedulerOutputProcessorMixin:
         except Exception as exc:
             logger.warning(
                 "UnifyInfer Phase 2.5 target trace output export failed for rid=%s: %s",
+                getattr(req, "rid", None),
+                exc,
+            )
+
+    def _unifyinfer_phase25_observe_shared_prefix_owner(
+        self, req: Req, *, source: str
+    ):
+        exporter = self._unifyinfer_phase25_shared_prefix_exporter()
+        if exporter is None or not getattr(exporter, "enabled", False):
+            return
+
+        try:
+            from unifyinfer.traces.sglang_target_event_export import (
+                observe_shared_prefix_cache_owner,
+            )
+
+            observe_shared_prefix_cache_owner(
+                exporter,
+                req,
+                page_size=int(getattr(self, "page_size", 1) or 1),
+                source=source,
+            )
+        except Exception as exc:
+            logger.warning(
+                "UnifyInfer Phase 2.5 shared-prefix owner export failed for rid=%s: %s",
+                getattr(req, "rid", None),
+                exc,
+            )
+
+    def _unifyinfer_phase25_observe_shared_prefix_borrow(
+        self, req: Req, *, source: str
+    ):
+        exporter = self._unifyinfer_phase25_shared_prefix_exporter()
+        if exporter is None or not getattr(exporter, "enabled", False):
+            return
+
+        try:
+            from unifyinfer.traces.sglang_target_event_export import (
+                observe_shared_prefix_borrow,
+            )
+
+            observe_shared_prefix_borrow(exporter, req, source=source)
+        except Exception as exc:
+            logger.warning(
+                "UnifyInfer Phase 2.5 shared-prefix borrow export failed for rid=%s: %s",
+                getattr(req, "rid", None),
+                exc,
+            )
+
+    def _unifyinfer_phase25_observe_shared_prefix_release(
+        self, req: Req, *, source: str
+    ):
+        exporter = self._unifyinfer_phase25_shared_prefix_exporter()
+        if exporter is None or not getattr(exporter, "enabled", False):
+            return
+
+        try:
+            from unifyinfer.traces.sglang_target_event_export import (
+                observe_shared_prefix_borrow_release,
+            )
+
+            observe_shared_prefix_borrow_release(exporter, req, source=source)
+        except Exception as exc:
+            logger.warning(
+                "UnifyInfer Phase 2.5 shared-prefix release export failed for rid=%s: %s",
                 getattr(req, "rid", None),
                 exc,
             )
@@ -255,9 +340,17 @@ class SchedulerOutputProcessorMixin:
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
                         release_kv_cache(req, self.tree_cache)
+                        self._unifyinfer_phase25_observe_shared_prefix_owner(
+                            req,
+                            source="prefill_cache_finished_req",
+                        )
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         self.tree_cache.cache_unfinished_req(req)
+                        self._unifyinfer_phase25_observe_shared_prefix_owner(
+                            req,
+                            source="cache_unfinished_req",
+                        )
                         if self.enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)
 
@@ -389,9 +482,17 @@ class SchedulerOutputProcessorMixin:
 
                     if req.finished():
                         release_kv_cache(req, self.tree_cache)
+                        self._unifyinfer_phase25_observe_shared_prefix_owner(
+                            req,
+                            source="embedding_cache_finished_req",
+                        )
                         req.time_stats.set_completion_time()
                     else:
                         self.tree_cache.cache_unfinished_req(req)
+                        self._unifyinfer_phase25_observe_shared_prefix_owner(
+                            req,
+                            source="embedding_cache_unfinished_req",
+                        )
                 else:
                     # being chunked reqs' prefill is not finished
                     req.is_chunked -= 1
@@ -626,6 +727,10 @@ class SchedulerOutputProcessorMixin:
                 if self.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
                 release_kv_cache(req, self.tree_cache)
+                self._unifyinfer_phase25_observe_shared_prefix_owner(
+                    req,
+                    source="cache_finished_req",
+                )
 
             req.time_stats.set_completion_time()
 
