@@ -123,8 +123,8 @@ class SchedulerOutputProcessorMixin:
                 req.customized_info[k].append(elem)
 
     def _unifyinfer_phase25_target_trace_exporter(self):
-        if hasattr(self, "_unifyinfer_phase25_target_trace_exporter"):
-            return self._unifyinfer_phase25_target_trace_exporter
+        if hasattr(self, "_unifyinfer_phase25_target_trace_exporter_instance"):
+            return self._unifyinfer_phase25_target_trace_exporter_instance
 
         try:
             from unifyinfer.traces.sglang_target_event_export import (
@@ -139,7 +139,7 @@ class SchedulerOutputProcessorMixin:
             )
             exporter = None
 
-        self._unifyinfer_phase25_target_trace_exporter = exporter
+        self._unifyinfer_phase25_target_trace_exporter_instance = exporter
         return exporter
 
     def _unifyinfer_phase25_observe_prefill(self, req: Req):
