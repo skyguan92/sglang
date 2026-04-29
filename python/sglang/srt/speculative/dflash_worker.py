@@ -112,6 +112,21 @@ class DFlashWorker:
             else None
         )
         self._trace_live_draft_kv_emitted = False
+        self._trace_live_handle_json = os.getenv(
+            "UNIFYINFER_DFLASH_TRACE_LIVE_HANDLE_JSON"
+        )
+        trace_live_handle_tokens = os.getenv(
+            "UNIFYINFER_DFLASH_TRACE_LIVE_HANDLE_TOKENS"
+        )
+        self._trace_live_handle_tokens = (
+            int(trace_live_handle_tokens)
+            if trace_live_handle_tokens is not None
+            else None
+        )
+        self._trace_live_handle_max_events = int(
+            os.getenv("UNIFYINFER_DFLASH_TRACE_LIVE_HANDLE_MAX_EVENTS", "1")
+        )
+        self._trace_live_handle_emitted = 0
 
         # Draft runner (separate KV cache + attention backend).
         # Without draft windowing, the draft worker aliases the target request->token
@@ -994,6 +1009,15 @@ class DFlashWorker:
                 raise RuntimeError(
                     f"DFLASH ctx_hidden/cache_loc mismatch: {ctx_hidden.shape[0]} vs {ctx_cache_loc.numel()}."
                 )
+            self._maybe_trace_live_handle_metadata(
+                batch=batch,
+                target_hidden=draft_input.target_hidden,
+                projected_hidden=ctx_hidden,
+                ctx_lens=ctx_lens,
+                ctx_positions=ctx_positions,
+                ctx_cache_loc=ctx_cache_loc,
+                req_pool_indices=req_pool_indices,
+            )
 
             if self._use_fused_kv_materialize and self._fused_kv_helper is not None:
                 try:
@@ -1039,6 +1063,52 @@ class DFlashWorker:
             draft_input.draft_seq_lens = batch.seq_lens.to(dtype=torch.int32)
         draft_input.ctx_lens = torch.zeros_like(ctx_lens)
         draft_input.target_hidden = draft_input.target_hidden[:0]
+
+    def _maybe_trace_live_handle_metadata(
+        self,
+        *,
+        batch: ScheduleBatch,
+        target_hidden: torch.Tensor,
+        projected_hidden: torch.Tensor,
+        ctx_lens: torch.Tensor,
+        ctx_positions: torch.Tensor,
+        ctx_cache_loc: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+    ) -> None:
+        if (
+            self._trace_live_handle_json is None
+            or self.tp_rank != 0
+            or self._trace_live_handle_emitted >= self._trace_live_handle_max_events
+            or (
+                self._trace_live_handle_tokens is not None
+                and int(projected_hidden.shape[0]) != self._trace_live_handle_tokens
+            )
+        ):
+            return
+
+        self._trace_live_handle_emitted += 1
+        try:
+            from unifyinfer.traces.sglang_target_event_export import (
+                observe_dflash_target_append,
+            )
+
+            observe_dflash_target_append(
+                self._trace_live_handle_json,
+                batch=batch,
+                target_hidden=target_hidden,
+                projected_hidden=projected_hidden,
+                ctx_lens=ctx_lens,
+                ctx_positions=ctx_positions,
+                ctx_cache_loc=ctx_cache_loc,
+                token_to_kv_pool=self.draft_model_runner.token_to_kv_pool,
+                req_pool_indices=req_pool_indices,
+                tp_rank=int(self.tp_rank),
+                block_size=int(self.block_size),
+                use_compact_draft_cache=bool(self.use_compact_draft_cache),
+                sync_epoch=int(self._trace_live_handle_emitted),
+            )
+        except Exception as e:
+            logger.warning("DFLASH live handle metadata trace failed: %s", e)
 
     def _append_target_hidden_sequential(
         self,
