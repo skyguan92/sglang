@@ -25,6 +25,72 @@ MAMBA_STATE_PER_REQ_NO_CACHE = 1
 logger = logging.getLogger(__name__)
 
 
+def _unifyinfer_phase3_cache_metadata_enabled() -> bool:
+    return bool(
+        os.getenv("UNIFYINFER_PHASE3_CACHE_METADATA_JSONL")
+        or os.getenv("UNIFYINFER_PHASE3_CACHE_METADATA_JSON")
+    )
+
+
+def _unifyinfer_phase3_observe_allocated_batch(
+    batch,
+    *,
+    out_cache_loc,
+    req_pool_indices=None,
+    source: str,
+    forward_mode: str,
+) -> None:
+    if not _unifyinfer_phase3_cache_metadata_enabled():
+        return
+    try:
+        from unifyinfer.traces.sglang_target_event_export import (
+            observe_phase3_cache_allocated_batch,
+            phase3_cache_metadata_exporter_from_env,
+        )
+
+        exporter = phase3_cache_metadata_exporter_from_env()
+        if exporter is not None and getattr(exporter, "enabled", False):
+            observe_phase3_cache_allocated_batch(
+                exporter,
+                batch,
+                out_cache_loc=out_cache_loc,
+                req_pool_indices=req_pool_indices,
+                source=source,
+                forward_mode=forward_mode,
+            )
+    except Exception as exc:  # pragma: no cover - fail-open live hook
+        logger.warning(
+            "UnifyInfer Phase 3 cache metadata export failed at %s: %s",
+            source,
+            exc,
+        )
+
+
+def _unifyinfer_phase3_observe_release(req, tree_cache, *, source: str) -> None:
+    if not _unifyinfer_phase3_cache_metadata_enabled():
+        return
+    try:
+        from unifyinfer.traces.sglang_target_event_export import (
+            observe_phase3_cache_release,
+            phase3_cache_metadata_exporter_from_env,
+        )
+
+        exporter = phase3_cache_metadata_exporter_from_env()
+        if exporter is not None and getattr(exporter, "enabled", False):
+            observe_phase3_cache_release(
+                exporter,
+                req,
+                tree_cache=tree_cache,
+                source=source,
+            )
+    except Exception as exc:  # pragma: no cover - fail-open live hook
+        logger.warning(
+            "UnifyInfer Phase 3 cache release export failed for rid=%s: %s",
+            getattr(req, "rid", None),
+            exc,
+        )
+
+
 @triton.jit
 def write_req_to_token_pool_triton(
     req_to_token_ptr,  # [max_batch, max_context_len]
@@ -389,6 +455,14 @@ def alloc_for_extend(
         batch.req_to_token_pool,
     )
 
+    _unifyinfer_phase3_observe_allocated_batch(
+        batch,
+        out_cache_loc=out_cache_loc,
+        req_pool_indices=req_pool_indices,
+        source="alloc_for_extend",
+        forward_mode="EXTEND",
+    )
+
     return out_cache_loc, req_pool_indices_device, req_pool_indices
 
 
@@ -460,6 +534,14 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
     )
 
+    _unifyinfer_phase3_observe_allocated_batch(
+        batch,
+        out_cache_loc=out_cache_loc,
+        req_pool_indices=batch.req_pool_indices,
+        source="alloc_for_decode",
+        forward_mode="DECODE",
+    )
+
     return out_cache_loc
 
 
@@ -497,6 +579,8 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
                 getattr(req, "rid", None),
                 exc,
             )
+
+    _unifyinfer_phase3_observe_release(req, tree_cache, source="release_kv_cache")
 
     tree_cache.cache_finished_req(req, is_insert=is_insert)
 
