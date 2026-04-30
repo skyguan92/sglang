@@ -1498,6 +1498,7 @@ class DFlashWorker:
         )
 
         _profile_phase = self._dflash_profile_start()
+        _verify_profile = {} if self._dflash_profile_enabled else None
         (
             new_verified_id,
             commit_lens,
@@ -1507,8 +1508,37 @@ class DFlashWorker:
             batch=batch,
             logits_output=logits_output,
             page_size=self.page_size,
+            profile=_verify_profile,
         )
         _profile_verify_update_ms = self._dflash_profile_elapsed_ms(_profile_phase)
+        if _verify_profile is not None:
+            _verify_profile_total_ms = sum(float(v) for v in _verify_profile.values())
+            self._dflash_profile_log(
+                "DFLASH profile verify_detail: step=%d bs=%d block_size=%d "
+                "logit_adjust_ms=%.3f accept_compute_ms=%.3f d2h_pack_ms=%.3f "
+                "request_update_ms=%.3f tensor_build_ms=%.3f "
+                "kv_free_compact_ms=%.3f req_kv_accounting_ms=%.3f "
+                "req_to_token_update_ms=%.3f seq_lens_update_ms=%.3f "
+                "hidden_slice_ms=%.3f hidden_clear_ms=%.3f "
+                "accounted_ms=%.3f outer_verify_ms=%.3f commit_lens=%s",
+                self._dflash_profile_step,
+                batch.batch_size(),
+                self.block_size,
+                _verify_profile.get("logit_adjust_ms", 0.0),
+                _verify_profile.get("accept_compute_ms", 0.0),
+                _verify_profile.get("d2h_pack_ms", 0.0),
+                _verify_profile.get("request_update_ms", 0.0),
+                _verify_profile.get("tensor_build_ms", 0.0),
+                _verify_profile.get("kv_free_compact_ms", 0.0),
+                _verify_profile.get("req_kv_accounting_ms", 0.0),
+                _verify_profile.get("req_to_token_update_ms", 0.0),
+                _verify_profile.get("seq_lens_update_ms", 0.0),
+                _verify_profile.get("hidden_slice_ms", 0.0),
+                _verify_profile.get("hidden_clear_ms", 0.0),
+                _verify_profile_total_ms,
+                _profile_verify_update_ms,
+                commit_lens.detach().cpu().tolist(),
+            )
         if need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
             _profile_phase = self._dflash_profile_start()

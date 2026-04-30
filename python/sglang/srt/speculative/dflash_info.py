@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import time
 from dataclasses import dataclass
 from typing import List, Tuple
 
@@ -22,6 +24,15 @@ from sglang.srt.speculative.dflash_utils import (
 )
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+from sglang.srt.utils import is_cuda
+
+logger = logging.getLogger(__name__)
+
+_DFLASH_VERIFY_TOTAL_ACCEPTED_DRAFT = 0
+_DFLASH_VERIFY_TOTAL_DRAFT_SLOTS = 0
+_DFLASH_VERIFY_TOTAL_COMMITTED = 0
+_DFLASH_VERIFY_TOTAL_BLOCK_SLOTS = 0
+_DFLASH_VERIFY_TOTAL_STEPS = 0
 
 
 def _compute_paged_keep_slots(
@@ -48,6 +59,26 @@ def _compute_paged_keep_slots(
     keep_slots = (keep_lens - prefix_lens).to(torch.int64)
     keep_slots.clamp_(min=0, max=int(draft_token_num))
     return keep_slots
+
+
+def _dflash_profile_start(profile: dict[str, float] | None):
+    if profile is None:
+        return None
+    if is_cuda():
+        torch.cuda.synchronize()
+    return time.perf_counter()
+
+
+def _dflash_profile_record(
+    profile: dict[str, float] | None,
+    key: str,
+    started_at,
+) -> None:
+    if profile is None or started_at is None:
+        return
+    if is_cuda():
+        torch.cuda.synchronize()
+    profile[key] = (time.perf_counter() - started_at) * 1000.0
 
 
 @dataclass
@@ -315,6 +346,7 @@ class DFlashVerifyInput(SpecInput):
         batch: ScheduleBatch,
         logits_output: LogitsProcessorOutput,
         page_size: int,
+        profile: dict[str, float] | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[int]]:
         """DFlash verification for greedy and non-greedy sampling.
 
@@ -324,6 +356,12 @@ class DFlashVerifyInput(SpecInput):
             next_target_hidden: tensor [sum(commit_lens), feature_dim]
             accept_length_per_req_cpu: list[int] (accepted draft tokens per request)
         """
+        global _DFLASH_VERIFY_TOTAL_ACCEPTED_DRAFT
+        global _DFLASH_VERIFY_TOTAL_DRAFT_SLOTS
+        global _DFLASH_VERIFY_TOTAL_COMMITTED
+        global _DFLASH_VERIFY_TOTAL_BLOCK_SLOTS
+        global _DFLASH_VERIFY_TOTAL_STEPS
+
         if batch.forward_mode.is_idle():
             empty = torch.empty((0,), dtype=torch.int64, device=batch.device)
             return empty, empty.to(torch.int32), empty, []
@@ -331,6 +369,7 @@ class DFlashVerifyInput(SpecInput):
         bs = batch.batch_size()
         device = logits_output.next_token_logits.device
 
+        phase = _dflash_profile_start(profile)
         sampling_info = batch.sampling_info
         if sampling_info is not None:
             if len(sampling_info) != bs:
@@ -360,7 +399,9 @@ class DFlashVerifyInput(SpecInput):
                 logits_output.next_token_logits.add_(
                     torch.repeat_interleave(linear_penalty, self.draft_token_num, dim=0)
                 )
+        _dflash_profile_record(profile, "logit_adjust_ms", phase)
 
+        phase = _dflash_profile_start(profile)
         candidates = self.draft_token.view(bs, self.draft_token_num)
         if (
             sampling_info is not None
@@ -380,17 +421,21 @@ class DFlashVerifyInput(SpecInput):
                 candidates=candidates,
                 target_predict=target_predict,
             )
+        _dflash_profile_record(profile, "accept_compute_ms", phase)
 
         # Single D2H transfer: candidates[1:] + accept_len + bonus
+        phase = _dflash_profile_start(profile)
         packed = torch.cat(
             [candidates[:, 1:], accept_len.unsqueeze(1), bonus.unsqueeze(1)], dim=1
         ).cpu()
+        _dflash_profile_record(profile, "d2h_pack_ms", phase)
 
         max_acc = self.draft_token_num - 1
         accept_length_per_req_cpu: List[int] = []
         commit_lens_cpu: List[int] = []
         new_verified_list: List[int] = []
 
+        phase = _dflash_profile_start(profile)
         for i, req in enumerate(batch.reqs):
             acc_len = int(packed[i, max_acc].item())
             proposed = packed[i, :acc_len].tolist() + [
@@ -423,13 +468,70 @@ class DFlashVerifyInput(SpecInput):
             accept_length_per_req_cpu.append(max(0, appended - 1))
             req.spec_verify_ct += 1
             req.spec_accepted_tokens += accept_length_per_req_cpu[-1]
+        _dflash_profile_record(profile, "request_update_ms", phase)
 
+        accepted_draft_total = int(sum(accept_length_per_req_cpu))
+        commit_total = int(sum(commit_lens_cpu))
+        draft_slot_total = int(bs * max_acc)
+        block_slot_total = int(bs * self.draft_token_num)
+
+        _DFLASH_VERIFY_TOTAL_ACCEPTED_DRAFT += accepted_draft_total
+        _DFLASH_VERIFY_TOTAL_DRAFT_SLOTS += draft_slot_total
+        _DFLASH_VERIFY_TOTAL_COMMITTED += commit_total
+        _DFLASH_VERIFY_TOTAL_BLOCK_SLOTS += block_slot_total
+        _DFLASH_VERIFY_TOTAL_STEPS += 1
+
+        draft_accept_rate = (
+            accepted_draft_total / draft_slot_total if draft_slot_total > 0 else 0.0
+        )
+        block_commit_rate = (
+            commit_total / block_slot_total if block_slot_total > 0 else 0.0
+        )
+        cumulative_draft_accept_rate = (
+            _DFLASH_VERIFY_TOTAL_ACCEPTED_DRAFT / _DFLASH_VERIFY_TOTAL_DRAFT_SLOTS
+            if _DFLASH_VERIFY_TOTAL_DRAFT_SLOTS > 0
+            else 0.0
+        )
+        cumulative_block_commit_rate = (
+            _DFLASH_VERIFY_TOTAL_COMMITTED / _DFLASH_VERIFY_TOTAL_BLOCK_SLOTS
+            if _DFLASH_VERIFY_TOTAL_BLOCK_SLOTS > 0
+            else 0.0
+        )
+        logger.info(
+            "DFLASH exact counters: step=%d bs=%d block_size=%d "
+            "accepted_draft=%d draft_slots=%d draft_accept_rate=%.6f "
+            "committed=%d block_slots=%d block_commit_rate=%.6f "
+            "cumulative_accepted_draft=%d cumulative_draft_slots=%d cumulative_draft_accept_rate=%.6f "
+            "cumulative_committed=%d cumulative_block_slots=%d cumulative_block_commit_rate=%.6f "
+            "accept_length_per_req=%s commit_lens=%s",
+            _DFLASH_VERIFY_TOTAL_STEPS,
+            bs,
+            self.draft_token_num,
+            accepted_draft_total,
+            draft_slot_total,
+            draft_accept_rate,
+            commit_total,
+            block_slot_total,
+            block_commit_rate,
+            _DFLASH_VERIFY_TOTAL_ACCEPTED_DRAFT,
+            _DFLASH_VERIFY_TOTAL_DRAFT_SLOTS,
+            cumulative_draft_accept_rate,
+            _DFLASH_VERIFY_TOTAL_COMMITTED,
+            _DFLASH_VERIFY_TOTAL_BLOCK_SLOTS,
+            cumulative_block_commit_rate,
+            accept_length_per_req_cpu,
+            commit_lens_cpu,
+        )
+
+        phase = _dflash_profile_start(profile)
         commit_lens = torch.tensor(commit_lens_cpu, dtype=torch.int32, device=device)
         new_verified_id = torch.tensor(
             new_verified_list, dtype=torch.int64, device=device
         )
+        _dflash_profile_record(profile, "tensor_build_ms", phase)
 
         # Free uncommitted KV cache slots and compact out_cache_loc.
+        phase = _dflash_profile_start(profile)
         if page_size == 1:
             out_cache_loc = batch.out_cache_loc.view(bs, self.draft_token_num)
             keep_mask = (
@@ -452,13 +554,17 @@ class DFlashVerifyInput(SpecInput):
 
             keep_mask = row_offsets < commit_lens[:, None]
             batch.out_cache_loc = out_cache_loc[keep_mask]
+        _dflash_profile_record(profile, "kv_free_compact_ms", phase)
 
         # Update req-level KV cache accounting.
+        phase = _dflash_profile_start(profile)
         for req, commit_len in zip(batch.reqs, commit_lens_cpu, strict=True):
             req.kv_committed_len += commit_len
             req.kv_allocated_len = req.kv_committed_len
+        _dflash_profile_record(profile, "req_kv_accounting_ms", phase)
 
         # Update req_to_token pool mapping for newly committed tokens.
+        phase = _dflash_profile_start(profile)
         end_offset = batch.seq_lens + commit_lens.to(batch.seq_lens.dtype)
         assign_req_to_token_pool_func(
             batch.req_pool_indices,
@@ -468,16 +574,20 @@ class DFlashVerifyInput(SpecInput):
             batch.out_cache_loc,
             bs,
         )
+        _dflash_profile_record(profile, "req_to_token_update_ms", phase)
 
         # Update batch seq lens.
+        phase = _dflash_profile_start(profile)
         batch.seq_lens.add_(commit_lens.to(batch.seq_lens.dtype))
         batch.seq_lens_cpu.add_(
             torch.tensor(commit_lens_cpu, dtype=batch.seq_lens_cpu.dtype)
         )
         # Keep seq_lens_sum in sync; flashinfer indices updaters rely on this for buffer sizing.
         batch.seq_lens_sum += sum(commit_lens_cpu)
+        _dflash_profile_record(profile, "seq_lens_update_ms", phase)
 
         # Build next-step context features from the committed verify-input tokens.
+        phase = _dflash_profile_start(profile)
         hidden = logits_output.hidden_states
         if hidden is None:
             raise RuntimeError(
@@ -489,9 +599,12 @@ class DFlashVerifyInput(SpecInput):
             if ln > 0:
                 segments.append(hidden[i, :ln, :])
         next_target_hidden = torch.cat(segments, dim=0) if segments else hidden[:0]
+        _dflash_profile_record(profile, "hidden_slice_ms", phase)
 
         # Avoid confusing downstream consumers (spec-v1 decode doesn't use this).
+        phase = _dflash_profile_start(profile)
         logits_output.hidden_states = None
+        _dflash_profile_record(profile, "hidden_clear_ms", phase)
 
         return (
             new_verified_id,
