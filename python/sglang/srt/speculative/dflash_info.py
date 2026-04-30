@@ -24,7 +24,7 @@ from sglang.srt.speculative.dflash_utils import (
 )
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda_alike
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +64,7 @@ def _compute_paged_keep_slots(
 def _dflash_profile_start(profile: dict[str, float] | None):
     if profile is None:
         return None
-    if is_cuda():
+    if is_cuda_alike():
         torch.cuda.synchronize()
     return time.perf_counter()
 
@@ -76,7 +76,7 @@ def _dflash_profile_record(
 ) -> None:
     if profile is None or started_at is None:
         return
-    if is_cuda():
+    if is_cuda_alike():
         torch.cuda.synchronize()
     profile[key] = (time.perf_counter() - started_at) * 1000.0
 

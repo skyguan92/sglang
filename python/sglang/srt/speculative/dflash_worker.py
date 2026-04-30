@@ -32,7 +32,7 @@ from sglang.srt.speculative.dflash_utils import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
-from sglang.srt.utils import get_bool_env_var, is_cuda
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_cuda_alike
 
 logger = logging.getLogger(__name__)
 
@@ -394,14 +394,14 @@ class DFlashWorker:
     def _dflash_profile_start(self):
         if not self._dflash_profile_enabled:
             return None
-        if is_cuda():
+        if is_cuda_alike():
             torch.cuda.synchronize()
         return time.perf_counter()
 
     def _dflash_profile_elapsed_ms(self, started_at) -> float:
         if started_at is None:
             return 0.0
-        if is_cuda():
+        if is_cuda_alike():
             torch.cuda.synchronize()
         return (time.perf_counter() - started_at) * 1000.0
 
