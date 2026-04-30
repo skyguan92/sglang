@@ -32,6 +32,10 @@ def _unifyinfer_phase3_cache_metadata_enabled() -> bool:
     )
 
 
+def _unifyinfer_phase3_shadow_mirror_enabled() -> bool:
+    return bool(os.getenv("UNIFYINFER_PHASE3_SHADOW_MIRROR_JSONL"))
+
+
 def _unifyinfer_phase3_observe_allocated_batch(
     batch,
     *,
@@ -66,6 +70,40 @@ def _unifyinfer_phase3_observe_allocated_batch(
         )
 
 
+def _unifyinfer_phase3_observe_shadow_mirror_allocated_batch(
+    batch,
+    *,
+    out_cache_loc,
+    req_pool_indices=None,
+    source: str,
+    forward_mode: str,
+) -> None:
+    if not _unifyinfer_phase3_shadow_mirror_enabled():
+        return
+    try:
+        from unifyinfer.traces.sglang_target_event_export import (
+            observe_phase3_shadow_mirror_allocated_batch,
+            phase3_shadow_mirror_probe_from_env,
+        )
+
+        probe = phase3_shadow_mirror_probe_from_env()
+        if probe is not None and getattr(probe, "enabled", False):
+            observe_phase3_shadow_mirror_allocated_batch(
+                probe,
+                batch,
+                out_cache_loc=out_cache_loc,
+                req_pool_indices=req_pool_indices,
+                source=source,
+                forward_mode=forward_mode,
+            )
+    except Exception as exc:  # pragma: no cover - fail-open live hook
+        logger.warning(
+            "UnifyInfer Phase 3 shadow mirror probe failed at %s: %s",
+            source,
+            exc,
+        )
+
+
 def _unifyinfer_phase3_observe_release(req, tree_cache, *, source: str) -> None:
     if not _unifyinfer_phase3_cache_metadata_enabled():
         return
@@ -86,6 +124,33 @@ def _unifyinfer_phase3_observe_release(req, tree_cache, *, source: str) -> None:
     except Exception as exc:  # pragma: no cover - fail-open live hook
         logger.warning(
             "UnifyInfer Phase 3 cache release export failed for rid=%s: %s",
+            getattr(req, "rid", None),
+            exc,
+        )
+
+
+def _unifyinfer_phase3_observe_shadow_mirror_release(
+    req, tree_cache, *, source: str
+) -> None:
+    if not _unifyinfer_phase3_shadow_mirror_enabled():
+        return
+    try:
+        from unifyinfer.traces.sglang_target_event_export import (
+            observe_phase3_shadow_mirror_release,
+            phase3_shadow_mirror_probe_from_env,
+        )
+
+        probe = phase3_shadow_mirror_probe_from_env()
+        if probe is not None and getattr(probe, "enabled", False):
+            observe_phase3_shadow_mirror_release(
+                probe,
+                req,
+                tree_cache=tree_cache,
+                source=source,
+            )
+    except Exception as exc:  # pragma: no cover - fail-open live hook
+        logger.warning(
+            "UnifyInfer Phase 3 shadow mirror release failed for rid=%s: %s",
             getattr(req, "rid", None),
             exc,
         )
@@ -462,6 +527,13 @@ def alloc_for_extend(
         source="alloc_for_extend",
         forward_mode="EXTEND",
     )
+    _unifyinfer_phase3_observe_shadow_mirror_allocated_batch(
+        batch,
+        out_cache_loc=out_cache_loc,
+        req_pool_indices=req_pool_indices,
+        source="alloc_for_extend",
+        forward_mode="EXTEND",
+    )
 
     return out_cache_loc, req_pool_indices_device, req_pool_indices
 
@@ -541,6 +613,13 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         source="alloc_for_decode",
         forward_mode="DECODE",
     )
+    _unifyinfer_phase3_observe_shadow_mirror_allocated_batch(
+        batch,
+        out_cache_loc=out_cache_loc,
+        req_pool_indices=batch.req_pool_indices,
+        source="alloc_for_decode",
+        forward_mode="DECODE",
+    )
 
     return out_cache_loc
 
@@ -581,6 +660,9 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             )
 
     _unifyinfer_phase3_observe_release(req, tree_cache, source="release_kv_cache")
+    _unifyinfer_phase3_observe_shadow_mirror_release(
+        req, tree_cache, source="release_kv_cache"
+    )
 
     tree_cache.cache_finished_req(req, is_insert=is_insert)
 
