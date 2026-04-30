@@ -17,6 +17,7 @@
 import os
 import logging
 import re
+import time
 from contextlib import nullcontext
 from collections import defaultdict
 from functools import lru_cache, partial
@@ -75,13 +76,20 @@ from sglang.srt.models.utils import (
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, get_bool_env_var, is_npu, round_up
+from sglang.srt.utils import (
+    add_prefix,
+    get_bool_env_var,
+    is_cuda_alike,
+    is_npu,
+    round_up,
+)
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 _is_npu = is_npu()
 _use_unifyinfer_qwen35_trace_mm_split = get_bool_env_var(
     "UNIFYINFER_QWEN35_TRACE_MM_SPLIT"
 )
+_use_unifyinfer_qwen35_dflash_profile = get_bool_env_var("SGLANG_DFLASH_PROFILE")
 graph_runners_dict = defaultdict(lambda: ViTCudaGraphRunner)
 if _is_npu:
     from sglang.srt.hardware_backend.npu.graph_runner.vit_npu_graph_runner import (
@@ -98,6 +106,30 @@ def _qwen35_mm_trace_span(name: str):
     if not _use_unifyinfer_qwen35_trace_mm_split:
         return nullcontext()
     return record_function(name)
+
+
+def _qwen35_dflash_profile_enabled(forward_batch: ForwardBatch) -> bool:
+    return (
+        _use_unifyinfer_qwen35_dflash_profile
+        and forward_batch is not None
+        and forward_batch.forward_mode.is_target_verify()
+    )
+
+
+def _qwen35_dflash_profile_start(enabled: bool):
+    if not enabled:
+        return None
+    if is_cuda_alike():
+        torch.cuda.synchronize()
+    return time.perf_counter()
+
+
+def _qwen35_dflash_profile_elapsed_ms(enabled: bool, started_at) -> float:
+    if not enabled or started_at is None:
+        return 0.0
+    if is_cuda_alike():
+        torch.cuda.synchronize()
+    return (time.perf_counter() - started_at) * 1000.0
 
 
 class Qwen3_VisionMLP(nn.Module):
@@ -1263,6 +1295,12 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         if self.is_mrope_enabled:
             positions = forward_batch.mrope_positions
 
+        dflash_profile_enabled = _qwen35_dflash_profile_enabled(forward_batch)
+        dflash_profile_total = _qwen35_dflash_profile_start(dflash_profile_enabled)
+        dflash_profile_step = int(
+            getattr(getattr(forward_batch, "spec_info", None), "profile_step", -1)
+        )
+
         if not (
             forward_batch.forward_mode.is_decode()
             or not forward_batch.contains_image_inputs()
@@ -1273,6 +1311,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                     f"(3, seq_len) positions, but got {positions.size()}"
                 )
 
+        dflash_profile_phase = _qwen35_dflash_profile_start(dflash_profile_enabled)
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
@@ -1282,6 +1321,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             use_deepstack=self.use_deepstack,
             pp_proxy_tensors=pp_proxy_tensors,
         )
+        dflash_language_model_ms = _qwen35_dflash_profile_elapsed_ms(
+            dflash_profile_enabled, dflash_profile_phase
+        )
 
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
@@ -1289,13 +1331,57 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
         if self.pp_group.is_last_rank:
             if not get_embedding:
-                return self.logits_processor(
+                dflash_profile_phase = _qwen35_dflash_profile_start(
+                    dflash_profile_enabled
+                )
+                logits_output = self.logits_processor(
                     input_ids,
                     hidden_states,
                     self.lm_head,
                     forward_batch,
                     aux_hidden_states,
                 )
+                dflash_logits_processor_ms = _qwen35_dflash_profile_elapsed_ms(
+                    dflash_profile_enabled, dflash_profile_phase
+                )
+                if dflash_profile_enabled:
+                    dflash_total_ms = _qwen35_dflash_profile_elapsed_ms(
+                        dflash_profile_enabled, dflash_profile_total
+                    )
+                    hidden_rows = int(hidden_states.shape[0])
+                    hidden_width = int(hidden_states.shape[-1])
+                    next_logits = getattr(logits_output, "next_token_logits", None)
+                    logits_rows = (
+                        int(next_logits.shape[0]) if next_logits is not None else 0
+                    )
+                    logits_width = (
+                        int(next_logits.shape[-1]) if next_logits is not None else 0
+                    )
+                    aux_count = (
+                        len(aux_hidden_states)
+                        if aux_hidden_states is not None
+                        else 0
+                    )
+                    logger.info(
+                        "DFLASH profile target_qwen35: step=%d forward_mode=%s "
+                        "input_tokens=%d language_model_ms=%.3f "
+                        "logits_processor_ms=%.3f total_ms=%.3f hidden_rows=%d "
+                        "hidden_width=%d logits_rows=%d logits_width=%d "
+                        "aux_hidden_count=%d capture_hidden_mode=%s",
+                        dflash_profile_step,
+                        str(forward_batch.forward_mode),
+                        int(input_ids.numel()) if input_ids is not None else 0,
+                        dflash_language_model_ms,
+                        dflash_logits_processor_ms,
+                        dflash_total_ms,
+                        hidden_rows,
+                        hidden_width,
+                        logits_rows,
+                        logits_width,
+                        aux_count,
+                        str(forward_batch.capture_hidden_mode),
+                    )
+                return logits_output
             else:
                 return self.pooler(hidden_states, forward_batch)
         else:
@@ -1309,7 +1395,16 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 "DFLASH requires explicit layer_ids for aux hidden capture."
             )
         self.capture_aux_hidden_states = True
-        self.model.set_dflash_layers_to_capture([val + 1 for val in layer_ids])
+        layers_to_capture = [val + 1 for val in layer_ids]
+        if hasattr(self.model, "set_dflash_layers_to_capture"):
+            self.model.set_dflash_layers_to_capture(layers_to_capture)
+        elif hasattr(self.model, "layers_to_capture"):
+            self.model.layers_to_capture = layers_to_capture
+        else:
+            raise ValueError(
+                f"Model {self.model.__class__.__name__} does not implement "
+                "DFLASH aux hidden-state capture."
+            )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

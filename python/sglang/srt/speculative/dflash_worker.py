@@ -762,6 +762,7 @@ class DFlashWorker:
             positions=positions,
             draft_token_num=self.block_size,
         )
+        verify_input.profile_step = self._dflash_profile_step
         _, build_custom_mask = resolve_dflash_verify_mask_policy(
             self.model_runner.attn_backend
         )

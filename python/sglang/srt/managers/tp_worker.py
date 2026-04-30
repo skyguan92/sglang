@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -42,7 +43,13 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
+from sglang.srt.utils import (
+    MultiprocessingSerializer,
+    broadcast_pyobj,
+    get_bool_env_var,
+    is_cuda_alike,
+    set_random_seed,
+)
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -57,6 +64,22 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _dflash_profile_start(enabled: bool):
+    if not enabled:
+        return None
+    if is_cuda_alike():
+        torch.cuda.synchronize()
+    return time.perf_counter()
+
+
+def _dflash_profile_elapsed_ms(enabled: bool, started_at) -> float:
+    if not enabled or started_at is None:
+        return 0.0
+    if is_cuda_alike():
+        torch.cuda.synchronize()
+    return (time.perf_counter() - started_at) * 1000.0
 
 
 class BaseTpWorker(ABC):
@@ -451,24 +474,51 @@ class TpModelWorker(BaseTpWorker):
         # FIXME(lsyin): maybe remove skip_attn_backend_init in forward_batch_generation,
         #               which requires preparing replay to always be in this function
 
+        dflash_profile_verify = bool(
+            is_verify and get_bool_env_var("SGLANG_DFLASH_PROFILE")
+        )
+        dflash_profile_total = _dflash_profile_start(dflash_profile_verify)
+        dflash_profile_step = -1
+        dflash_init_forward_batch_ms = 0.0
+
         # Get forward batch from model worker batch
         if model_worker_batch is not None:
+            dflash_profile_step = int(
+                getattr(model_worker_batch, "_dflash_profile_step", -1)
+            )
+            dflash_profile_phase = _dflash_profile_start(dflash_profile_verify)
             # update the consumer index of hicache to the running batch
             self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)
 
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+            if dflash_profile_step < 0:
+                dflash_profile_step = int(
+                    getattr(
+                        getattr(forward_batch, "spec_info", None), "profile_step", -1
+                    )
+                )
+            dflash_init_forward_batch_ms = _dflash_profile_elapsed_ms(
+                dflash_profile_verify, dflash_profile_phase
+            )
         else:
             # FIXME(lsyin): unify the interface of forward_batch
             assert forward_batch is not None
+            dflash_profile_step = int(
+                getattr(getattr(forward_batch, "spec_info", None), "profile_step", -1)
+            )
 
         if self.is_dllm():
             return self._forward_batch_generation_dllm(forward_batch)
 
         if self.pp_group.is_last_rank:
+            dflash_profile_phase = _dflash_profile_start(dflash_profile_verify)
             out = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
                 skip_attn_backend_init=skip_attn_backend_init,
+            )
+            dflash_model_runner_forward_ms = _dflash_profile_elapsed_ms(
+                dflash_profile_verify, dflash_profile_phase
             )
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
             batch_result = GenerationBatchResult(
@@ -476,6 +526,30 @@ class TpModelWorker(BaseTpWorker):
                 can_run_cuda_graph=can_run_cuda_graph,
                 expert_distribution_metrics=out.expert_distribution_metrics,
             )
+            if dflash_profile_verify and self.tp_rank == 0:
+                dflash_total_ms = _dflash_profile_elapsed_ms(
+                    dflash_profile_verify, dflash_profile_total
+                )
+                input_tokens = (
+                    int(forward_batch.input_ids.numel())
+                    if forward_batch.input_ids is not None
+                    else 0
+                )
+                logger.info(
+                    "DFLASH profile target_worker: step=%d forward_mode=%s "
+                    "input_tokens=%d seq_lens_sum=%d init_forward_batch_ms=%.3f "
+                    "model_runner_forward_ms=%.3f total_ms=%.3f "
+                    "can_run_cuda_graph=%s capture_hidden_mode=%s",
+                    dflash_profile_step,
+                    str(forward_batch.forward_mode),
+                    input_tokens,
+                    int(forward_batch.seq_lens_sum),
+                    dflash_init_forward_batch_ms,
+                    dflash_model_runner_forward_ms,
+                    dflash_total_ms,
+                    str(can_run_cuda_graph),
+                    str(forward_batch.capture_hidden_mode),
+                )
 
             if is_verify:
                 # Skip sampling and return logits for target forward
