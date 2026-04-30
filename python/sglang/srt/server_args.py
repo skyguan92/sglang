@@ -2267,9 +2267,18 @@ class ServerArgs:
                     "Please use --mamba-scheduler-strategy no_buffer instead."
                 )
 
-            assert (
-                is_cuda()
-            ), "Mamba extra_buffer is only supported on CUDA devices with FLA backend"
+            (
+                extra_buffer_supported,
+                extra_buffer_reason,
+            ) = self._mamba_extra_buffer_backend_support(model_arch)
+            if not extra_buffer_supported:
+                raise ValueError(extra_buffer_reason)
+            if is_hip():
+                logger.warning(
+                    "Enabling experimental ROCm Mamba radix extra_buffer for %s "
+                    "with Triton linear-attention kernels.",
+                    model_arch,
+                )
             if self.speculative_num_draft_tokens is not None:
                 assert (
                     self.mamba_track_interval >= self.speculative_num_draft_tokens
@@ -2311,6 +2320,39 @@ class ServerArgs:
                         f"Speculative decoding for {model_arch} is not compatible with radix cache when using --mamba-scheduler-strategy no_buffer."
                         "To use radix cache with speculative decoding, please use --mamba-scheduler-strategy extra_buffer and set SGLANG_ENABLE_SPEC_V2=1."
                     )
+
+    def _mamba_extra_buffer_backend_support(self, model_arch: str) -> tuple[bool, str]:
+        """Return whether Mamba radix extra_buffer can run on this device/backend.
+
+        CUDA remains the upstream/default path. ROCm is allowed only for the
+        Triton GDN linear-attention path used by Qwen3-Next/Qwen3.5-style hybrid
+        models; CUDA-only FlashInfer/CuTeDSL linear-attention backends are still
+        rejected before runtime.
+        """
+
+        if is_cuda():
+            return True, "CUDA device"
+
+        if is_hip():
+            decode_backend = self.linear_attn_decode_backend or self.linear_attn_backend
+            prefill_backend = (
+                self.linear_attn_prefill_backend or self.linear_attn_backend
+            )
+            if decode_backend == "triton" and prefill_backend == "triton":
+                return True, "ROCm Triton linear-attention backend"
+            return (
+                False,
+                "Mamba extra_buffer on ROCm requires Triton linear-attention "
+                "backends for both decode and prefill, "
+                f"but got decode={decode_backend!r}, prefill={prefill_backend!r} "
+                f"for {model_arch}.",
+            )
+
+        return (
+            False,
+            "Mamba extra_buffer is only supported on CUDA devices or on ROCm "
+            "with Triton linear-attention backends.",
+        )
 
     def _handle_sampling_backend(self):
         if self.sampling_backend is None:
