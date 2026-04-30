@@ -2,6 +2,7 @@ import json
 import logging
 import math
 import os
+import time
 from copy import deepcopy
 from typing import Optional, Union
 
@@ -85,6 +86,10 @@ class DFlashWorker:
 
         self._warned_sampling_fallback = False
         self._logged_first_verify = False
+        self._dflash_profile_enabled = os.environ.get(
+            "SGLANG_DFLASH_PROFILE", ""
+        ).lower() not in ("", "0", "false", "no", "off")
+        self._dflash_profile_step = 0
         self._disable_fused_kv_materialize = get_bool_env_var(
             "UNIFYINFER_DFLASH_DISABLE_FUSED_KV_MATERIALIZE"
         )
@@ -386,6 +391,24 @@ class DFlashWorker:
         # Delegate anything not implemented yet to the target worker.
         return getattr(self.target_worker, name)
 
+    def _dflash_profile_start(self):
+        if not self._dflash_profile_enabled:
+            return None
+        if is_cuda():
+            torch.cuda.synchronize()
+        return time.perf_counter()
+
+    def _dflash_profile_elapsed_ms(self, started_at) -> float:
+        if started_at is None:
+            return 0.0
+        if is_cuda():
+            torch.cuda.synchronize()
+        return (time.perf_counter() - started_at) * 1000.0
+
+    def _dflash_profile_log(self, msg: str, *args) -> None:
+        if self._dflash_profile_enabled and self.tp_rank == 0:
+            logger.info(msg, *args)
+
     def clear_cache_pool(self):
         # The target worker owns the shared KV allocator/cache. For the compact
         # sliding-window path, the draft req->token view is rebuilt from committed
@@ -586,9 +609,13 @@ class DFlashWorker:
                 self._warned_sampling_fallback = True
 
         bs = batch.batch_size()
+        self._dflash_profile_step += 1
+        _profile_prepare_total = self._dflash_profile_start()
+        _profile_phase = self._dflash_profile_start()
 
         # --- 1) Append any newly committed tokens into the draft KV cache.
         self._append_target_hidden_to_draft_kv(batch, draft_input)
+        _profile_kv_prev_ms = self._dflash_profile_elapsed_ms(_profile_phase)
 
         target_model = self.target_worker.model_runner.model
         embed_module = target_model.get_input_embeddings()
@@ -615,8 +642,10 @@ class DFlashWorker:
         block_ids.fill_(int(self._mask_token_id))
         block_ids[:, 0].copy_(draft_input.verified_id.to(torch.long))
 
+        _profile_phase = self._dflash_profile_start()
         noise_embedding = embed_module(block_ids)
         input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
+        _profile_embed_ms = self._dflash_profile_elapsed_ms(_profile_phase)
 
         # For spec-v1, the draft KV cache is always materialized before drafting the
         # next block. `target_prefix_lens` stay absolute for RoPE; `draft_prefix_lens`
@@ -642,6 +671,7 @@ class DFlashWorker:
         seq_lens_cpu.copy_(draft_prefix_lens.to(device="cpu", dtype=torch.int32))
         allocator = self.draft_model_runner.token_to_kv_pool_allocator
         token_to_kv_pool_state_backup = allocator.backup_state()
+        _profile_phase = self._dflash_profile_start()
         try:
             if self.page_size == 1:
                 block_cache_loc = allocator.alloc(bs * self.block_size)
@@ -673,6 +703,7 @@ class DFlashWorker:
                 block_cache_loc,
                 bs,
             )
+            _profile_alloc_ms = self._dflash_profile_elapsed_ms(_profile_phase)
 
             # Use TARGET_VERIFY mode (cuda-graphable) to run a fixed-size draft block.
             # In this mode, `seq_lens` stores the prefix lengths; attention backends
@@ -699,10 +730,14 @@ class DFlashWorker:
                 capture_hidden_mode=CaptureHiddenMode.NULL,
             )
 
+            _profile_phase = self._dflash_profile_start()
             with torch.inference_mode():
                 draft_logits_output = self.draft_model_runner.forward(
                     forward_batch
                 ).logits_output
+            _profile_draft_forward_ms = self._dflash_profile_elapsed_ms(
+                _profile_phase
+            )
         finally:
             # Drop the speculative block from the shared allocator (EAGLE3-style).
             allocator.restore_state(token_to_kv_pool_state_backup)
@@ -711,10 +746,12 @@ class DFlashWorker:
         if draft_hidden is None:
             raise RuntimeError("DFLASH draft model returned no hidden states.")
         draft_hidden = draft_hidden.view(bs, self.block_size, -1)
+        _profile_phase = self._dflash_profile_start()
         draft_next = self._greedy_sample_from_vocab_parallel_head(
             hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
             lm_head=lm_head,
         ).view(bs, self.block_size - 1)
+        _profile_greedy_ms = self._dflash_profile_elapsed_ms(_profile_phase)
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
@@ -728,11 +765,13 @@ class DFlashWorker:
         _, build_custom_mask = resolve_dflash_verify_mask_policy(
             self.model_runner.attn_backend
         )
+        _profile_phase = self._dflash_profile_start()
         verify_input.prepare_for_verify(
             batch,
             self.page_size,
             build_custom_mask=build_custom_mask,
         )
+        _profile_verify_prepare_ms = self._dflash_profile_elapsed_ms(_profile_phase)
 
         batch.forward_mode = (
             ForwardMode.TARGET_VERIFY
@@ -741,6 +780,24 @@ class DFlashWorker:
         )
         batch.spec_info = verify_input
         batch.return_hidden_states = False
+        _profile_prepare_total_ms = self._dflash_profile_elapsed_ms(
+            _profile_prepare_total
+        )
+        self._dflash_profile_log(
+            "DFLASH profile prepare: step=%d bs=%d block_size=%d "
+            "kv_prev_ms=%.3f embed_ms=%.3f alloc_ms=%.3f draft_forward_ms=%.3f "
+            "greedy_lm_head_ms=%.3f verify_prepare_ms=%.3f total_ms=%.3f",
+            self._dflash_profile_step,
+            bs,
+            self.block_size,
+            _profile_kv_prev_ms,
+            _profile_embed_ms,
+            _profile_alloc_ms,
+            _profile_draft_forward_ms,
+            _profile_greedy_ms,
+            _profile_verify_prepare_ms,
+            _profile_prepare_total_ms,
+        )
 
     def _greedy_sample_from_vocab_parallel_head(
         self,
@@ -1414,7 +1471,9 @@ class DFlashWorker:
                 "This usually means the request did not complete the prefill stage."
             )
 
+        _profile_total = self._dflash_profile_start()
         self._prepare_for_speculative_decoding(batch, draft_input)
+        _profile_prepare_ms = self._dflash_profile_elapsed_ms(_profile_total)
 
         model_worker_batch = batch.get_model_worker_batch()
         assert model_worker_batch.forward_mode.is_target_verify()
@@ -1428,14 +1487,17 @@ class DFlashWorker:
             batch.seq_lens.clone() if need_mamba_verify_commit else None
         )
 
+        _profile_phase = self._dflash_profile_start()
         batch_result = self.target_worker.forward_batch_generation(
             model_worker_batch, is_verify=True, **kwargs
         )
+        _profile_target_verify_ms = self._dflash_profile_elapsed_ms(_profile_phase)
         logits_output, can_run_cuda_graph = (
             batch_result.logits_output,
             batch_result.can_run_cuda_graph,
         )
 
+        _profile_phase = self._dflash_profile_start()
         (
             new_verified_id,
             commit_lens,
@@ -1446,24 +1508,49 @@ class DFlashWorker:
             logits_output=logits_output,
             page_size=self.page_size,
         )
+        _profile_verify_update_ms = self._dflash_profile_elapsed_ms(_profile_phase)
         if need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
+            _profile_phase = self._dflash_profile_start()
             self._update_target_mamba_state_after_verify(
                 batch=batch,
                 seq_lens_pre_verify=seq_lens_pre_verify,
                 commit_lens=commit_lens,
             )
+            _profile_mamba_ms = self._dflash_profile_elapsed_ms(_profile_phase)
+        else:
+            _profile_mamba_ms = 0.0
 
         # Update draft state for the next iteration. Also materialize the committed verify tokens
         # into the draft KV cache immediately so radix cache entries are safe to reuse.
         draft_input.verified_id = new_verified_id
         draft_input.target_hidden = next_target_hidden
         draft_input.ctx_lens = commit_lens
+        _profile_phase = self._dflash_profile_start()
         self._append_target_hidden_to_draft_kv(batch, draft_input)
+        _profile_kv_after_ms = self._dflash_profile_elapsed_ms(_profile_phase)
         batch.spec_info = draft_input
         batch.forward_mode = ForwardMode.DECODE
 
         num_accepted_tokens = sum(accept_length_per_req_cpu)
+        _profile_total_ms = self._dflash_profile_elapsed_ms(_profile_total)
+        self._dflash_profile_log(
+            "DFLASH profile decode: step=%d bs=%d block_size=%d "
+            "prepare_ms=%.3f target_verify_forward_ms=%.3f "
+            "verify_accept_update_ms=%.3f mamba_commit_ms=%.3f "
+            "kv_after_verify_ms=%.3f total_ms=%.3f accepted_tokens=%d commit_lens=%s",
+            self._dflash_profile_step,
+            batch.batch_size(),
+            self.block_size,
+            _profile_prepare_ms,
+            _profile_target_verify_ms,
+            _profile_verify_update_ms,
+            _profile_mamba_ms,
+            _profile_kv_after_ms,
+            _profile_total_ms,
+            num_accepted_tokens,
+            commit_lens.detach().cpu().tolist(),
+        )
         if not self._logged_first_verify and self.tp_rank == 0:
             logger.info(
                 "DFLASH verify completed. accept_length_per_req=%s",
