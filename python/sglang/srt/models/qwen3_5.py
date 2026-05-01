@@ -280,6 +280,42 @@ def _qwen35_dflash_profile_elapsed_ms(enabled: bool, started_at) -> float:
     return (time.perf_counter() - started_at) * 1000.0
 
 
+def _qwen35_dflash_new_layer_profile() -> dict[str, float | int]:
+    return {
+        "profiled_layers": 0,
+        "linear_layers": 0,
+        "attention_layers": 0,
+        "prepare_attn_capture_ms": 0.0,
+        "linear_attn_ms": 0.0,
+        "self_attn_ms": 0.0,
+        "prepare_mlp_ms": 0.0,
+        "mlp_ms": 0.0,
+        "postprocess_ms": 0.0,
+        "layer_total_ms": 0.0,
+        "gdn_inproj_ms": 0.0,
+        "gdn_repack_ms": 0.0,
+        "gdn_core_ms": 0.0,
+        "gdn_postnorm_ms": 0.0,
+        "gdn_outproj_ms": 0.0,
+    }
+
+
+def _qwen35_dflash_layer_profile(forward_batch: Optional[ForwardBatch]):
+    if not _qwen35_dflash_profile_enabled(forward_batch):
+        return None
+    return getattr(forward_batch, "_qwen35_dflash_layer_profile", None)
+
+
+def _qwen35_dflash_profile_add(profile, key: str, value: float) -> None:
+    if profile is not None:
+        profile[key] = float(profile.get(key, 0.0)) + float(value)
+
+
+def _qwen35_dflash_profile_inc(profile, key: str) -> None:
+    if profile is not None:
+        profile[key] = int(profile.get(key, 0)) + 1
+
+
 def _should_use_unifyinfer_qwen35_fused_rmsnorm_gated(
     forward_batch: Optional[ForwardBatch],
 ) -> bool:
@@ -648,12 +684,23 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         2. Core attention (custom op)
         3. Output projection
         """
+        dflash_profile = _qwen35_dflash_layer_profile(forward_batch)
+        dflash_profile_enabled = dflash_profile is not None
+        dflash_profile_phase = _qwen35_dflash_profile_start(dflash_profile_enabled)
         with _qwen35_trace_span("_qwen35_gdnsplit_inproj"):
             projected_states_qkvz, projected_states_ba = self._forward_input_proj(
                 hidden_states,
                 forward_batch,
             )
+        _qwen35_dflash_profile_add(
+            dflash_profile,
+            "gdn_inproj_ms",
+            _qwen35_dflash_profile_elapsed_ms(
+                dflash_profile_enabled, dflash_profile_phase
+            ),
+        )
 
+        dflash_profile_phase = _qwen35_dflash_profile_start(dflash_profile_enabled)
         with _qwen35_trace_span("_qwen35_gdnsplit_repack"):
             self._refresh_attn_conv_weights()
 
@@ -689,7 +736,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     lambda x: x.reshape(x.shape[0], -1), (query, key, value)
                 )
                 mixed_qkv = torch.cat((query, key, value), dim=-1)
+        _qwen35_dflash_profile_add(
+            dflash_profile,
+            "gdn_repack_ms",
+            _qwen35_dflash_profile_elapsed_ms(
+                dflash_profile_enabled, dflash_profile_phase
+            ),
+        )
 
+        dflash_profile_phase = _qwen35_dflash_profile_start(dflash_profile_enabled)
         with _qwen35_trace_span("_qwen35_gdnsplit_core"):
             core_attn_out = self.attn(
                 forward_batch,
@@ -697,7 +752,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 a=a,
                 b=b,
             )
+        _qwen35_dflash_profile_add(
+            dflash_profile,
+            "gdn_core_ms",
+            _qwen35_dflash_profile_elapsed_ms(
+                dflash_profile_enabled, dflash_profile_phase
+            ),
+        )
 
+        dflash_profile_phase = _qwen35_dflash_profile_start(dflash_profile_enabled)
         with _qwen35_trace_span("_qwen35_gdnsplit_postnorm"):
             z_shape_og = z.shape
             # reshape input data into 2D tensor
@@ -723,9 +786,24 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 core_attn_out = self.norm(core_attn_out, z)
             core_attn_out = core_attn_out.reshape(z_shape_og)
             core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
+        _qwen35_dflash_profile_add(
+            dflash_profile,
+            "gdn_postnorm_ms",
+            _qwen35_dflash_profile_elapsed_ms(
+                dflash_profile_enabled, dflash_profile_phase
+            ),
+        )
 
+        dflash_profile_phase = _qwen35_dflash_profile_start(dflash_profile_enabled)
         with _qwen35_trace_span("_qwen35_gdnsplit_outproj"):
             output, _ = self.out_proj(core_attn_out)
+        _qwen35_dflash_profile_add(
+            dflash_profile,
+            "gdn_outproj_ms",
+            _qwen35_dflash_profile_elapsed_ms(
+                dflash_profile_enabled, dflash_profile_phase
+            ),
+        )
         return output
 
 
@@ -810,7 +888,11 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         **kwargs,
     ):
         forward_batch = kwargs.get("forward_batch", None)
+        dflash_profile = _qwen35_dflash_layer_profile(forward_batch)
+        dflash_profile_enabled = dflash_profile is not None
+        dflash_profile_total = _qwen35_dflash_profile_start(dflash_profile_enabled)
 
+        dflash_profile_phase = _qwen35_dflash_profile_start(dflash_profile_enabled)
         hidden_states, residual = (
             self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
                 hidden_states,
@@ -821,16 +903,41 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 ),
             )
         )
+        _qwen35_dflash_profile_add(
+            dflash_profile,
+            "prepare_attn_capture_ms",
+            _qwen35_dflash_profile_elapsed_ms(
+                dflash_profile_enabled, dflash_profile_phase
+            ),
+        )
 
         if not forward_batch.forward_mode.is_idle():
+            dflash_profile_phase = _qwen35_dflash_profile_start(
+                dflash_profile_enabled
+            )
             hidden_states = self.linear_attn(
                 hidden_states,
                 forward_batch,
             )
+            _qwen35_dflash_profile_add(
+                dflash_profile,
+                "linear_attn_ms",
+                _qwen35_dflash_profile_elapsed_ms(
+                    dflash_profile_enabled, dflash_profile_phase
+                ),
+            )
 
         # Fully Connected
+        dflash_profile_phase = _qwen35_dflash_profile_start(dflash_profile_enabled)
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
+        )
+        _qwen35_dflash_profile_add(
+            dflash_profile,
+            "prepare_mlp_ms",
+            _qwen35_dflash_profile_elapsed_ms(
+                dflash_profile_enabled, dflash_profile_phase
+            ),
         )
 
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
@@ -842,6 +949,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 forward_batch
             )
         )
+        dflash_profile_phase = _qwen35_dflash_profile_start(dflash_profile_enabled)
         if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
             hidden_states = self.mlp(
                 hidden_states,
@@ -853,13 +961,40 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             hidden_states = self.mlp(
                 hidden_states, should_allreduce_fusion, use_reduce_scatter
             )
+        _qwen35_dflash_profile_add(
+            dflash_profile,
+            "mlp_ms",
+            _qwen35_dflash_profile_elapsed_ms(
+                dflash_profile_enabled, dflash_profile_phase
+            ),
+        )
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
         else:
+            dflash_profile_phase = _qwen35_dflash_profile_start(
+                dflash_profile_enabled
+            )
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
+            _qwen35_dflash_profile_add(
+                dflash_profile,
+                "postprocess_ms",
+                _qwen35_dflash_profile_elapsed_ms(
+                    dflash_profile_enabled, dflash_profile_phase
+                ),
+            )
 
+        if dflash_profile is not None:
+            _qwen35_dflash_profile_inc(dflash_profile, "profiled_layers")
+            _qwen35_dflash_profile_inc(dflash_profile, "linear_layers")
+            _qwen35_dflash_profile_add(
+                dflash_profile,
+                "layer_total_ms",
+                _qwen35_dflash_profile_elapsed_ms(
+                    dflash_profile_enabled, dflash_profile_total
+                ),
+            )
         return hidden_states, residual
 
 
@@ -1114,6 +1249,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         captured_last_layer_outputs: Optional[list[torch.Tensor]] = None,
         **kwargs,
     ):
+        dflash_profile = _qwen35_dflash_layer_profile(forward_batch)
+        dflash_profile_enabled = dflash_profile is not None
+        dflash_profile_total = _qwen35_dflash_profile_start(dflash_profile_enabled)
+
+        dflash_profile_phase = _qwen35_dflash_profile_start(dflash_profile_enabled)
         hidden_states, residual = (
             self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
                 hidden_states,
@@ -1122,17 +1262,42 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 captured_last_layer_outputs=captured_last_layer_outputs,
             )
         )
+        _qwen35_dflash_profile_add(
+            dflash_profile,
+            "prepare_attn_capture_ms",
+            _qwen35_dflash_profile_elapsed_ms(
+                dflash_profile_enabled, dflash_profile_phase
+            ),
+        )
 
         if not forward_batch.forward_mode.is_idle():
+            dflash_profile_phase = _qwen35_dflash_profile_start(
+                dflash_profile_enabled
+            )
             hidden_states = self.self_attention(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
+            _qwen35_dflash_profile_add(
+                dflash_profile,
+                "self_attn_ms",
+                _qwen35_dflash_profile_elapsed_ms(
+                    dflash_profile_enabled, dflash_profile_phase
+                ),
+            )
 
         # Fully Connected
+        dflash_profile_phase = _qwen35_dflash_profile_start(dflash_profile_enabled)
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
+        )
+        _qwen35_dflash_profile_add(
+            dflash_profile,
+            "prepare_mlp_ms",
+            _qwen35_dflash_profile_elapsed_ms(
+                dflash_profile_enabled, dflash_profile_phase
+            ),
         )
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
@@ -1143,6 +1308,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 forward_batch
             )
         )
+        dflash_profile_phase = _qwen35_dflash_profile_start(dflash_profile_enabled)
         if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
             hidden_states = self.mlp(
                 hidden_states,
@@ -1154,13 +1320,40 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             hidden_states = self.mlp(
                 hidden_states, should_allreduce_fusion, use_reduce_scatter
             )
+        _qwen35_dflash_profile_add(
+            dflash_profile,
+            "mlp_ms",
+            _qwen35_dflash_profile_elapsed_ms(
+                dflash_profile_enabled, dflash_profile_phase
+            ),
+        )
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
         else:
+            dflash_profile_phase = _qwen35_dflash_profile_start(
+                dflash_profile_enabled
+            )
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
+            _qwen35_dflash_profile_add(
+                dflash_profile,
+                "postprocess_ms",
+                _qwen35_dflash_profile_elapsed_ms(
+                    dflash_profile_enabled, dflash_profile_phase
+                ),
+            )
 
+        if dflash_profile is not None:
+            _qwen35_dflash_profile_inc(dflash_profile, "profiled_layers")
+            _qwen35_dflash_profile_inc(dflash_profile, "attention_layers")
+            _qwen35_dflash_profile_add(
+                dflash_profile,
+                "layer_total_ms",
+                _qwen35_dflash_profile_elapsed_ms(
+                    dflash_profile_enabled, dflash_profile_total
+                ),
+            )
         return hidden_states, residual
 
 
@@ -1278,6 +1471,12 @@ class Qwen3_5ForCausalLM(nn.Module):
         dflash_profile_step = int(
             getattr(getattr(forward_batch, "spec_info", None), "profile_step", -1)
         )
+        if dflash_profile_enabled:
+            setattr(
+                forward_batch,
+                "_qwen35_dflash_layer_profile",
+                _qwen35_dflash_new_layer_profile(),
+            )
 
         # Initialize hidden states
         dflash_profile_phase = _qwen35_dflash_profile_start(dflash_profile_enabled)
@@ -1353,11 +1552,47 @@ class Qwen3_5ForCausalLM(nn.Module):
             dflash_total_ms = _qwen35_dflash_profile_elapsed_ms(
                 dflash_profile_enabled, dflash_profile_total
             )
+            dflash_layer_profile = getattr(
+                forward_batch,
+                "_qwen35_dflash_layer_profile",
+                _qwen35_dflash_new_layer_profile(),
+            )
             captured_layers = [
                 layer_id
                 for layer_id in self.layers_to_capture
                 if self.start_layer <= layer_id < self.end_layer
             ]
+            logger.info(
+                "DFLASH profile target_qwen35_layer_body: step=%d "
+                "forward_mode=%s start_layer=%d end_layer=%d "
+                "profiled_layers=%d linear_layers=%d attention_layers=%d "
+                "prepare_attn_capture_ms=%.3f linear_attn_ms=%.3f "
+                "self_attn_ms=%.3f prepare_mlp_ms=%.3f mlp_ms=%.3f "
+                "postprocess_ms=%.3f layer_total_ms=%.3f "
+                "gdn_inproj_ms=%.3f gdn_repack_ms=%.3f gdn_core_ms=%.3f "
+                "gdn_postnorm_ms=%.3f gdn_outproj_ms=%.3f "
+                "captured_layers=%s",
+                dflash_profile_step,
+                str(forward_batch.forward_mode),
+                int(self.start_layer),
+                int(self.end_layer),
+                int(dflash_layer_profile["profiled_layers"]),
+                int(dflash_layer_profile["linear_layers"]),
+                int(dflash_layer_profile["attention_layers"]),
+                float(dflash_layer_profile["prepare_attn_capture_ms"]),
+                float(dflash_layer_profile["linear_attn_ms"]),
+                float(dflash_layer_profile["self_attn_ms"]),
+                float(dflash_layer_profile["prepare_mlp_ms"]),
+                float(dflash_layer_profile["mlp_ms"]),
+                float(dflash_layer_profile["postprocess_ms"]),
+                float(dflash_layer_profile["layer_total_ms"]),
+                float(dflash_layer_profile["gdn_inproj_ms"]),
+                float(dflash_layer_profile["gdn_repack_ms"]),
+                float(dflash_layer_profile["gdn_core_ms"]),
+                float(dflash_layer_profile["gdn_postnorm_ms"]),
+                float(dflash_layer_profile["gdn_outproj_ms"]),
+                ",".join(str(layer) for layer in captured_layers) or "-",
+            )
             logger.info(
                 "DFLASH profile target_qwen35_model: step=%d forward_mode=%s "
                 "input_tokens=%d start_layer=%d end_layer=%d layer_count=%d "
