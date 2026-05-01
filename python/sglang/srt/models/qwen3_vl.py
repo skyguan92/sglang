@@ -1027,7 +1027,13 @@ class Qwen3LLMModel(Qwen3Model):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         input_deepstack_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        dflash_profile_enabled = _qwen35_dflash_profile_enabled(forward_batch)
+        dflash_profile_total = _qwen35_dflash_profile_start(dflash_profile_enabled)
+        dflash_profile_step = int(
+            getattr(getattr(forward_batch, "spec_info", None), "profile_step", -1)
+        )
 
+        dflash_profile_phase = _qwen35_dflash_profile_start(dflash_profile_enabled)
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -1038,16 +1044,31 @@ class Qwen3LLMModel(Qwen3Model):
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
+        dflash_embed_ms = _qwen35_dflash_profile_elapsed_ms(
+            dflash_profile_enabled, dflash_profile_phase
+        )
 
         aux_hidden_states = []
+        dflash_aux_capture_ms = 0.0
+        dflash_capture_count = 0
+        dflash_captured_layers: list[int] = []
+        dflash_profile_phase = _qwen35_dflash_profile_start(dflash_profile_enabled)
         for layer_idx, layer in enumerate(
             self.layers[self.start_layer : self.end_layer]
         ):
             layer_idx = layer_idx + self.start_layer
             if layer_idx in self.layers_to_capture:
+                dflash_capture_phase = _qwen35_dflash_profile_start(
+                    dflash_profile_enabled
+                )
                 aux_hidden_states.append(
                     hidden_states + residual if residual is not None else hidden_states
                 )
+                dflash_aux_capture_ms += _qwen35_dflash_profile_elapsed_ms(
+                    dflash_profile_enabled, dflash_capture_phase
+                )
+                dflash_capture_count += 1
+                dflash_captured_layers.append(layer_idx)
 
             # SGLang applies residual at the START of the next layer, not at the END like HuggingFace.
             # See: https://github.com/huggingface/transformers/blob/v5.0.0rc0/src/transformers/models/qwen3_vl/modeling_qwen3_vl.py#L549
@@ -1064,6 +1085,9 @@ class Qwen3LLMModel(Qwen3Model):
                 residual,
                 post_residual_addition=deepstack_embeds,
             )
+        dflash_layer_loop_ms = _qwen35_dflash_profile_elapsed_ms(
+            dflash_profile_enabled, dflash_profile_phase
+        )
 
         # Handle deepstack for the last processed layer if it exists.
         last_deepstack = self.get_deepstack_embeds(
@@ -1078,6 +1102,9 @@ class Qwen3LLMModel(Qwen3Model):
                 }
             )
         else:
+            dflash_profile_phase = _qwen35_dflash_profile_start(
+                dflash_profile_enabled
+            )
             if hidden_states.shape[0] != 0:
                 if residual is None:
                     hidden_states = self.norm(hidden_states)
@@ -1085,6 +1112,38 @@ class Qwen3LLMModel(Qwen3Model):
                     hidden_states, _ = self.norm(
                         hidden_states, residual, post_residual_addition=last_deepstack
                     )
+            dflash_norm_ms = _qwen35_dflash_profile_elapsed_ms(
+                dflash_profile_enabled, dflash_profile_phase
+            )
+
+        if dflash_profile_enabled:
+            dflash_total_ms = _qwen35_dflash_profile_elapsed_ms(
+                dflash_profile_enabled, dflash_profile_total
+            )
+            dflash_layer_compute_ms = max(
+                0.0, dflash_layer_loop_ms - dflash_aux_capture_ms
+            )
+            logger.info(
+                "DFLASH profile target_qwen35_model: step=%d forward_mode=%s "
+                "input_tokens=%d start_layer=%d end_layer=%d layer_count=%d "
+                "capture_count=%d embed_ms=%.3f aux_capture_ms=%.3f "
+                "layer_loop_ms=%.3f layer_compute_ms=%.3f norm_ms=%.3f "
+                "total_ms=%.3f captured_layers=%s",
+                dflash_profile_step,
+                str(forward_batch.forward_mode),
+                int(input_ids.numel()) if input_ids is not None else 0,
+                int(self.start_layer),
+                int(self.end_layer),
+                int(self.end_layer - self.start_layer),
+                dflash_capture_count,
+                dflash_embed_ms,
+                dflash_aux_capture_ms,
+                dflash_layer_loop_ms,
+                dflash_layer_compute_ms,
+                dflash_norm_ms,
+                dflash_total_ms,
+                ",".join(str(layer) for layer in dflash_captured_layers) or "-",
+            )
 
         if len(aux_hidden_states) == 0:
             return hidden_states

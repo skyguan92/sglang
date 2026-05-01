@@ -16,6 +16,7 @@
 
 import logging
 import os
+import time
 from contextlib import nullcontext
 from functools import lru_cache
 from typing import Iterable, Optional, Set, Tuple, Union
@@ -95,6 +96,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_cuda,
+    is_cuda_alike,
     is_gfx95_supported,
     is_hip,
     is_npu,
@@ -219,6 +221,7 @@ _use_unifyinfer_qwen35_fused_rmsnorm_gated_prefill_only = (
 _use_unifyinfer_qwen35_trace_attn_split = get_bool_env_var(
     "UNIFYINFER_QWEN35_TRACE_ATTN_SPLIT"
 )
+_use_unifyinfer_qwen35_dflash_profile = get_bool_env_var("SGLANG_DFLASH_PROFILE")
 _is_amx_available = cpu_has_amx_support()
 
 
@@ -251,6 +254,30 @@ def _qwen35_trace_span(name: str):
     if not _use_unifyinfer_qwen35_trace_attn_split:
         return nullcontext()
     return record_function(name)
+
+
+def _qwen35_dflash_profile_enabled(forward_batch: Optional[ForwardBatch]) -> bool:
+    return (
+        _use_unifyinfer_qwen35_dflash_profile
+        and forward_batch is not None
+        and forward_batch.forward_mode.is_target_verify()
+    )
+
+
+def _qwen35_dflash_profile_start(enabled: bool):
+    if not enabled:
+        return None
+    if is_cuda_alike():
+        torch.cuda.synchronize()
+    return time.perf_counter()
+
+
+def _qwen35_dflash_profile_elapsed_ms(enabled: bool, started_at) -> float:
+    if not enabled or started_at is None:
+        return 0.0
+    if is_cuda_alike():
+        torch.cuda.synchronize()
+    return (time.perf_counter() - started_at) * 1000.0
 
 
 def _should_use_unifyinfer_qwen35_fused_rmsnorm_gated(
@@ -1246,7 +1273,14 @@ class Qwen3_5ForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         input_deepstack_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        dflash_profile_enabled = _qwen35_dflash_profile_enabled(forward_batch)
+        dflash_profile_total = _qwen35_dflash_profile_start(dflash_profile_enabled)
+        dflash_profile_step = int(
+            getattr(getattr(forward_batch, "spec_info", None), "profile_step", -1)
+        )
+
         # Initialize hidden states
+        dflash_profile_phase = _qwen35_dflash_profile_start(dflash_profile_enabled)
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -1257,8 +1291,12 @@ class Qwen3_5ForCausalLM(nn.Module):
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
+        dflash_embed_ms = _qwen35_dflash_profile_elapsed_ms(
+            dflash_profile_enabled, dflash_profile_phase
+        )
 
         aux_hidden_states = []
+        dflash_profile_phase = _qwen35_dflash_profile_start(dflash_profile_enabled)
         # Pass through decoder layers
         for layer_idx in range(self.start_layer, self.end_layer):
             layer = self.layers[layer_idx]
@@ -1287,6 +1325,9 @@ class Qwen3_5ForCausalLM(nn.Module):
                 hidden_states.add_(
                     input_deepstack_embeds[:, sep : sep + self.hidden_size]
                 )
+        dflash_layer_loop_ms = _qwen35_dflash_profile_elapsed_ms(
+            dflash_profile_enabled, dflash_profile_phase
+        )
 
         # Return intermediate tensors for pipeline parallelism
         if not self.pp_group.is_last_rank:
@@ -1298,11 +1339,46 @@ class Qwen3_5ForCausalLM(nn.Module):
             )
 
         # Apply final normalization
+        dflash_profile_phase = _qwen35_dflash_profile_start(dflash_profile_enabled)
         if hidden_states.shape[0] != 0:
             if residual is None:
                 hidden_states = self.norm(hidden_states)
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
+        dflash_norm_ms = _qwen35_dflash_profile_elapsed_ms(
+            dflash_profile_enabled, dflash_profile_phase
+        )
+
+        if dflash_profile_enabled:
+            dflash_total_ms = _qwen35_dflash_profile_elapsed_ms(
+                dflash_profile_enabled, dflash_profile_total
+            )
+            captured_layers = [
+                layer_id
+                for layer_id in self.layers_to_capture
+                if self.start_layer <= layer_id < self.end_layer
+            ]
+            logger.info(
+                "DFLASH profile target_qwen35_model: step=%d forward_mode=%s "
+                "input_tokens=%d start_layer=%d end_layer=%d layer_count=%d "
+                "capture_count=%d embed_ms=%.3f aux_capture_ms=%.3f "
+                "layer_loop_ms=%.3f layer_compute_ms=%.3f norm_ms=%.3f "
+                "total_ms=%.3f captured_layers=%s",
+                dflash_profile_step,
+                str(forward_batch.forward_mode),
+                int(input_ids.numel()) if input_ids is not None else 0,
+                int(self.start_layer),
+                int(self.end_layer),
+                int(self.end_layer - self.start_layer),
+                len(captured_layers),
+                dflash_embed_ms,
+                0.0,
+                dflash_layer_loop_ms,
+                dflash_layer_loop_ms,
+                dflash_norm_ms,
+                dflash_total_ms,
+                ",".join(str(layer) for layer in captured_layers) or "-",
+            )
 
         if len(aux_hidden_states) == 0:
             return hidden_states
