@@ -403,6 +403,7 @@ class DFlashVerifyInput(SpecInput):
 
         phase = _dflash_profile_start(profile)
         candidates = self.draft_token.view(bs, self.draft_token_num)
+        target_predict = None
         if (
             sampling_info is not None
             and not sampling_info.is_all_greedy
@@ -594,6 +595,31 @@ class DFlashVerifyInput(SpecInput):
                 "DFLASH verify requires target hidden states, but got None."
             )
         hidden = hidden.view(bs, self.draft_token_num, -1)
+        if target_predict is not None:
+            try:
+                from unifyinfer.traces.dflash_partial_verify_capture import (
+                    maybe_append_dflash_partial_verify_capture,
+                )
+
+                maybe_append_dflash_partial_verify_capture(
+                    candidates=candidates,
+                    target_predict=target_predict,
+                    hidden=hidden,
+                    accept_length_per_req=accept_length_per_req_cpu,
+                    commit_lens=commit_lens_cpu,
+                    new_verified_id=new_verified_list,
+                    profile_step=getattr(self, "profile_step", None),
+                    req_ids=[
+                        getattr(req, "rid", getattr(req, "request_id", index))
+                        for index, req in enumerate(batch.reqs)
+                    ],
+                    source={
+                        "hook": "DFlashVerifyInput.verify",
+                        "trace_env": "UNIFYINFER_DFLASH_PARTIAL_VERIFY_CAPTURE_JSONL",
+                    },
+                )
+            except Exception as e:
+                logger.warning("DFLASH partial verify capture failed: %s", e)
         segments: List[torch.Tensor] = []
         for i, ln in enumerate(commit_lens_cpu):
             if ln > 0:
