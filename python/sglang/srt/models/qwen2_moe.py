@@ -17,6 +17,7 @@
 """Inference-only Qwen2MoE model compatible with HuggingFace weights."""
 
 import logging
+import time
 from contextlib import contextmanager, nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -94,6 +95,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_cuda,
+    is_cuda_alike,
     is_hip,
     make_layers,
     use_intel_amx_backend,
@@ -139,6 +141,43 @@ _disable_unifyinfer_qwen35_shared_expert = get_bool_env_var(
 _disable_unifyinfer_qwen35_shared_expert_prefill_only = get_bool_env_var(
     "UNIFYINFER_QWEN35_DISABLE_SHARED_EXPERT_PREFILL_ONLY"
 )
+_use_unifyinfer_qwen35_dflash_profile = get_bool_env_var("SGLANG_DFLASH_PROFILE")
+
+
+def _qwen35_moe_dflash_profile(forward_batch: Optional[ForwardBatch]):
+    if not (
+        _use_unifyinfer_qwen35_dflash_profile
+        and forward_batch is not None
+        and forward_batch.forward_mode.is_target_verify()
+    ):
+        return None
+    return getattr(forward_batch, "_qwen35_dflash_layer_profile", None)
+
+
+def _qwen35_moe_dflash_profile_start(profile):
+    if profile is None:
+        return None
+    if is_cuda_alike():
+        torch.cuda.synchronize()
+    return time.perf_counter()
+
+
+def _qwen35_moe_dflash_profile_elapsed_ms(profile, started_at) -> float:
+    if profile is None or started_at is None:
+        return 0.0
+    if is_cuda_alike():
+        torch.cuda.synchronize()
+    return (time.perf_counter() - started_at) * 1000.0
+
+
+def _qwen35_moe_dflash_profile_add(profile, key: str, value: float) -> None:
+    if profile is not None:
+        profile[key] = float(profile.get(key, 0.0)) + float(value)
+
+
+def _qwen35_moe_dflash_profile_inc(profile, key: str) -> None:
+    if profile is not None:
+        profile[key] = int(profile.get(key, 0)) + 1
 
 
 def _should_use_unifyinfer_qwen35_hip_alt_stream_decode_only(
@@ -410,14 +449,30 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         forward_batch: Optional[ForwardBatch] = None,
     ) -> StandardTopKOutput:
         """Append shared expert ids and weights to topk output before fused MoE."""
+        dflash_profile = _qwen35_moe_dflash_profile(forward_batch)
+        dflash_profile_phase = _qwen35_moe_dflash_profile_start(dflash_profile)
         if not (
             self.enable_shared_expert_fusion
             and _should_use_unifyinfer_qwen35_shared_expert_fusion(forward_batch)
             and not _should_disable_unifyinfer_qwen35_shared_expert(forward_batch)
         ):
+            _qwen35_moe_dflash_profile_add(
+                dflash_profile,
+                "moe_append_shared_ms",
+                _qwen35_moe_dflash_profile_elapsed_ms(
+                    dflash_profile, dflash_profile_phase
+                ),
+            )
             return topk_output
         shared_weights = self._get_shared_expert_weights(hidden_states)
         if shared_weights is None:
+            _qwen35_moe_dflash_profile_add(
+                dflash_profile,
+                "moe_append_shared_ms",
+                _qwen35_moe_dflash_profile_elapsed_ms(
+                    dflash_profile, dflash_profile_phase
+                ),
+            )
             return topk_output
 
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_kernels import (
@@ -431,6 +486,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             self.num_fused_shared_experts,
             N=self.num_experts,
         )
+        _qwen35_moe_dflash_profile_add(
+            dflash_profile,
+            "moe_append_shared_ms",
+            _qwen35_moe_dflash_profile_elapsed_ms(dflash_profile, dflash_profile_phase),
+        )
         return StandardTopKOutput(
             topk_weights=fused_topk_weights,
             topk_ids=fused_topk_ids,
@@ -442,7 +502,16 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
     ):
+        dflash_profile = _qwen35_moe_dflash_profile(forward_batch)
+        dflash_profile_phase = _qwen35_moe_dflash_profile_start(dflash_profile)
         if _should_disable_unifyinfer_qwen35_shared_expert(forward_batch):
+            _qwen35_moe_dflash_profile_add(
+                dflash_profile,
+                "moe_shared_expert_ms",
+                _qwen35_moe_dflash_profile_elapsed_ms(
+                    dflash_profile, dflash_profile_phase
+                ),
+            )
             return None
         shared_output = None
         if self.shared_expert is not None:
@@ -462,9 +531,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                         * shared_output
                     )
 
+        _qwen35_moe_dflash_profile_add(
+            dflash_profile,
+            "moe_shared_expert_ms",
+            _qwen35_moe_dflash_profile_elapsed_ms(dflash_profile, dflash_profile_phase),
+        )
         return shared_output
 
     def _forward_deepep(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
+        dflash_profile = _qwen35_moe_dflash_profile(forward_batch)
         shared_output = None
         use_fused_shared_expert = (
             self.enable_shared_expert_fusion
@@ -473,16 +548,32 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         )
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
+            dflash_profile_phase = _qwen35_moe_dflash_profile_start(dflash_profile)
             router_logits, _ = self.gate(hidden_states)
+            _qwen35_moe_dflash_profile_add(
+                dflash_profile,
+                "moe_gate_ms",
+                _qwen35_moe_dflash_profile_elapsed_ms(
+                    dflash_profile, dflash_profile_phase
+                ),
+            )
             if not use_fused_shared_expert:
                 shared_output = self._forward_shared_experts(
                     hidden_states, forward_batch
                 )
+            dflash_profile_phase = _qwen35_moe_dflash_profile_start(dflash_profile)
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
                 num_token_non_padded=forward_batch.num_token_non_padded,
                 expert_location_dispatch_info=self._expert_location_dispatch_info(),
+            )
+            _qwen35_moe_dflash_profile_add(
+                dflash_profile,
+                "moe_topk_ms",
+                _qwen35_moe_dflash_profile_elapsed_ms(
+                    dflash_profile, dflash_profile_phase
+                ),
             )
             if use_fused_shared_expert and TopKOutputChecker.format_is_standard(
                 topk_output
@@ -492,13 +583,27 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
+        dflash_profile_phase = _qwen35_moe_dflash_profile_start(dflash_profile)
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
             topk_output=topk_output,
         )
+        _qwen35_moe_dflash_profile_add(
+            dflash_profile,
+            "moe_routed_experts_ms",
+            _qwen35_moe_dflash_profile_elapsed_ms(dflash_profile, dflash_profile_phase),
+        )
 
         if shared_output is not None:
+            dflash_profile_phase = _qwen35_moe_dflash_profile_start(dflash_profile)
             final_hidden_states.add_(shared_output)
+            _qwen35_moe_dflash_profile_add(
+                dflash_profile,
+                "moe_add_shared_ms",
+                _qwen35_moe_dflash_profile_elapsed_ms(
+                    dflash_profile, dflash_profile_phase
+                ),
+            )
 
         return final_hidden_states
 
@@ -507,12 +612,25 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
     ):
+        dflash_profile = _qwen35_moe_dflash_profile(forward_batch)
         # router_logits: (num_tokens, n_experts)
+        dflash_profile_phase = _qwen35_moe_dflash_profile_start(dflash_profile)
         router_logits, _ = self.gate(hidden_states)
+        _qwen35_moe_dflash_profile_add(
+            dflash_profile,
+            "moe_gate_ms",
+            _qwen35_moe_dflash_profile_elapsed_ms(dflash_profile, dflash_profile_phase),
+        )
+        dflash_profile_phase = _qwen35_moe_dflash_profile_start(dflash_profile)
         topk_output = self.topk(
             hidden_states,
             router_logits,
             expert_location_dispatch_info=self._expert_location_dispatch_info(),
+        )
+        _qwen35_moe_dflash_profile_add(
+            dflash_profile,
+            "moe_topk_ms",
+            _qwen35_moe_dflash_profile_elapsed_ms(dflash_profile, dflash_profile_phase),
         )
         if self.enable_shared_expert_fusion and TopKOutputChecker.format_is_standard(
             topk_output
@@ -521,7 +639,16 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 topk_output, hidden_states, forward_batch
             )
         with self._maybe_use_unifyinfer_decode_unfused_expert_view(forward_batch):
-            return self.experts(hidden_states, topk_output)
+            dflash_profile_phase = _qwen35_moe_dflash_profile_start(dflash_profile)
+            result = self.experts(hidden_states, topk_output)
+            _qwen35_moe_dflash_profile_add(
+                dflash_profile,
+                "moe_routed_experts_ms",
+                _qwen35_moe_dflash_profile_elapsed_ms(
+                    dflash_profile, dflash_profile_phase
+                ),
+            )
+            return result
 
     @contextmanager
     def _maybe_use_unifyinfer_decode_unfused_expert_view(
@@ -616,6 +743,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         use_reduce_scatter: bool = False,
         should_allreduce_fusion: bool = False,
     ) -> torch.Tensor:
+        dflash_profile = _qwen35_moe_dflash_profile(forward_batch)
+        dflash_profile_total = _qwen35_moe_dflash_profile_start(dflash_profile)
+        _qwen35_moe_dflash_profile_inc(dflash_profile, "moe_layers")
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         disable_shared_expert = _should_disable_unifyinfer_qwen35_shared_expert(
@@ -626,9 +756,21 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             and not disable_shared_expert
             and _should_use_unifyinfer_qwen35_shared_expert_fusion(forward_batch)
         )
+        if disable_shared_expert:
+            _qwen35_moe_dflash_profile_inc(dflash_profile, "moe_shared_disabled_layers")
+        if use_fused_shared_expert:
+            _qwen35_moe_dflash_profile_inc(dflash_profile, "moe_fused_shared_layers")
 
         if get_moe_a2a_backend().is_deepep():
-            return self._forward_deepep(hidden_states, forward_batch)
+            final_hidden_states = self._forward_deepep(hidden_states, forward_batch)
+            _qwen35_moe_dflash_profile_add(
+                dflash_profile,
+                "moe_total_ms",
+                _qwen35_moe_dflash_profile_elapsed_ms(
+                    dflash_profile, dflash_profile_total
+                ),
+            )
+            return final_hidden_states.view(num_tokens, hidden_dim)
 
         if (
             self.alt_stream is not None
@@ -643,6 +785,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 )
             )
         ):
+            _qwen35_moe_dflash_profile_inc(dflash_profile, "moe_dual_stream_layers")
             final_hidden_states, shared_output = self.forward_normal_dual_stream(
                 hidden_states, forward_batch
             )
@@ -657,11 +800,19 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
 
         if shared_output is not None:
+            dflash_profile_phase = _qwen35_moe_dflash_profile_start(dflash_profile)
             # In-place add is required to keep final_hidden_states in the
             # symmetric memory pool (when --enable-symm-mem is used).
             # An out-of-place add would allocate a new tensor outside symm
             # memory, breaking subsequent symmetric collective operations.
             final_hidden_states += shared_output
+            _qwen35_moe_dflash_profile_add(
+                dflash_profile,
+                "moe_add_shared_ms",
+                _qwen35_moe_dflash_profile_elapsed_ms(
+                    dflash_profile, dflash_profile_phase
+                ),
+            )
         if (
             self.tp_size > 1
             and not should_allreduce_fusion
@@ -669,8 +820,23 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             and not should_use_flashinfer_cutlass_moe_fp4_allgather()
             and not should_use_dp_reduce_scatterv()
         ):
+            dflash_profile_phase = _qwen35_moe_dflash_profile_start(dflash_profile)
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            _qwen35_moe_dflash_profile_add(
+                dflash_profile,
+                "moe_allreduce_ms",
+                _qwen35_moe_dflash_profile_elapsed_ms(
+                    dflash_profile, dflash_profile_phase
+                ),
+            )
 
+        _qwen35_moe_dflash_profile_add(
+            dflash_profile,
+            "moe_total_ms",
+            _qwen35_moe_dflash_profile_elapsed_ms(
+                dflash_profile, dflash_profile_total
+            ),
+        )
         return final_hidden_states.view(num_tokens, hidden_dim)
 
 

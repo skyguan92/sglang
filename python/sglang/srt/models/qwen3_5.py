@@ -297,6 +297,18 @@ def _qwen35_dflash_new_layer_profile() -> dict[str, float | int]:
         "gdn_core_ms": 0.0,
         "gdn_postnorm_ms": 0.0,
         "gdn_outproj_ms": 0.0,
+        "moe_layers": 0,
+        "moe_dual_stream_layers": 0,
+        "moe_fused_shared_layers": 0,
+        "moe_shared_disabled_layers": 0,
+        "moe_gate_ms": 0.0,
+        "moe_topk_ms": 0.0,
+        "moe_append_shared_ms": 0.0,
+        "moe_routed_experts_ms": 0.0,
+        "moe_shared_expert_ms": 0.0,
+        "moe_add_shared_ms": 0.0,
+        "moe_allreduce_ms": 0.0,
+        "moe_total_ms": 0.0,
     }
 
 
@@ -1592,6 +1604,31 @@ class Qwen3_5ForCausalLM(nn.Module):
                 float(dflash_layer_profile["gdn_postnorm_ms"]),
                 float(dflash_layer_profile["gdn_outproj_ms"]),
                 ",".join(str(layer) for layer in captured_layers) or "-",
+            )
+            logger.info(
+                "DFLASH profile target_qwen35_moe: step=%d "
+                "forward_mode=%s start_layer=%d end_layer=%d "
+                "moe_layers=%d dual_stream_layers=%d fused_shared_layers=%d "
+                "shared_disabled_layers=%d gate_ms=%.3f topk_ms=%.3f "
+                "append_shared_ms=%.3f routed_experts_ms=%.3f "
+                "shared_expert_ms=%.3f add_shared_ms=%.3f "
+                "allreduce_ms=%.3f total_ms=%.3f",
+                dflash_profile_step,
+                str(forward_batch.forward_mode),
+                int(self.start_layer),
+                int(self.end_layer),
+                int(dflash_layer_profile["moe_layers"]),
+                int(dflash_layer_profile["moe_dual_stream_layers"]),
+                int(dflash_layer_profile["moe_fused_shared_layers"]),
+                int(dflash_layer_profile["moe_shared_disabled_layers"]),
+                float(dflash_layer_profile["moe_gate_ms"]),
+                float(dflash_layer_profile["moe_topk_ms"]),
+                float(dflash_layer_profile["moe_append_shared_ms"]),
+                float(dflash_layer_profile["moe_routed_experts_ms"]),
+                float(dflash_layer_profile["moe_shared_expert_ms"]),
+                float(dflash_layer_profile["moe_add_shared_ms"]),
+                float(dflash_layer_profile["moe_allreduce_ms"]),
+                float(dflash_layer_profile["moe_total_ms"]),
             )
             logger.info(
                 "DFLASH profile target_qwen35_model: step=%d forward_mode=%s "
