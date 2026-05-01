@@ -1847,6 +1847,80 @@ class DFlashWorker:
         )
         return visible, allocated, allocation_width
 
+    def _linear_forward_metadata_holder(self):
+        attn_backend = self.target_worker.model_runner.attn_backend
+        return getattr(attn_backend, "linear_attn_backend", attn_backend)
+
+    def _backup_true_partial_intermediate_cache(
+        self,
+        *,
+        batch: ScheduleBatch,
+        bs: int,
+    ) -> dict[str, Any] | None:
+        req_to_token_pool = batch.req_to_token_pool
+        if not hasattr(req_to_token_pool, "get_speculative_mamba2_params_all_layers"):
+            return None
+        try:
+            caches = req_to_token_pool.get_speculative_mamba2_params_all_layers()
+            if not hasattr(caches, "intermediate_ssm"):
+                return None
+            indices = torch.arange(
+                int(bs),
+                dtype=torch.long,
+                device=caches.intermediate_ssm.device,
+            )
+            backup: dict[str, Any] = {
+                "indices": indices,
+                "intermediate_ssm": caches.intermediate_ssm[:, indices]
+                .detach()
+                .clone(),
+                "intermediate_conv_window": [],
+            }
+            intermediate_conv_cache = getattr(caches, "intermediate_conv_window", None)
+            if intermediate_conv_cache is not None:
+                backup["intermediate_conv_window"] = [
+                    (idx, tensor[:, indices].detach().clone())
+                    for idx, tensor in enumerate(intermediate_conv_cache)
+                ]
+            return backup
+        except Exception as e:
+            logger.warning(
+                "DFLASH true partial proof-request intermediate-cache backup failed: %s",
+                e,
+            )
+            return None
+
+    def _restore_true_partial_intermediate_cache(
+        self,
+        *,
+        batch: ScheduleBatch,
+        backup: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        if backup is None:
+            return {"present": False, "restored": False}
+        try:
+            caches = batch.req_to_token_pool.get_speculative_mamba2_params_all_layers()
+            indices = backup["indices"]
+            caches.intermediate_ssm[:, indices] = backup["intermediate_ssm"]
+            restored_conv = 0
+            intermediate_conv_cache = getattr(caches, "intermediate_conv_window", None)
+            if intermediate_conv_cache is not None:
+                for idx, saved in backup.get("intermediate_conv_window", []):
+                    intermediate_conv_cache[idx][:, indices] = saved
+                    restored_conv += 1
+            return {
+                "present": True,
+                "restored": True,
+                "indices": [int(item) for item in indices.detach().cpu().tolist()],
+                "conv_windows_restored": restored_conv,
+            }
+        except Exception as e:
+            logger.warning(
+                "DFLASH true partial proof-request intermediate-cache restore failed: %s",
+                e,
+            )
+            return {"present": True, "restored": False, "error": str(e)}
+
     def _run_true_partial_verify_proof_request_forward(
         self,
         *,
@@ -1878,6 +1952,25 @@ class DFlashWorker:
             page_size=int(self.page_size),
             req_pool_available=len(free_slots),
             req_to_token_table_width=int(req_to_token.shape[1]),
+            mamba_pool_available=(
+                batch.req_to_token_pool.mamba_pool.available_size()
+                if has_mamba_mapping and hasattr(batch.req_to_token_pool, "mamba_pool")
+                else None
+            ),
+            mamba_ping_pong_track_buffer_width=(
+                int(
+                    getattr(
+                        batch.req_to_token_pool,
+                        "mamba_ping_pong_track_buffer_size",
+                        0,
+                    )
+                )
+                if hasattr(
+                    batch.req_to_token_pool,
+                    "req_index_to_mamba_ping_pong_track_buffer_mapping",
+                )
+                else 0
+            ),
             allocator_class=batch.token_to_kv_pool_allocator.__class__.__module__
             + "."
             + batch.token_to_kv_pool_allocator.__class__.__name__,
@@ -1899,6 +1992,18 @@ class DFlashWorker:
         saved_req_rows: list[tuple[int, int, torch.Tensor]] = []
         saved_mamba_rows: list[tuple[torch.Tensor, int, torch.Tensor]] = []
         mamba_mapping_copies: list[dict] = []
+        mamba_state_forks: list[dict] = []
+        mamba_pool = getattr(req_to_token_pool, "mamba_pool", None)
+        saved_mamba_free_slots = (
+            mamba_pool.free_slots.detach().clone() if mamba_pool is not None else None
+        )
+        intermediate_cache_backup = self._backup_true_partial_intermediate_cache(
+            batch=batch,
+            bs=bs,
+        )
+        restore_report: dict[str, Any] = {}
+        metadata_holder = self._linear_forward_metadata_holder()
+        saved_forward_metadata = getattr(metadata_holder, "forward_metadata", None)
         proof_req_pool_indices = torch.tensor(
             proof_req_pool_indices_cpu,
             dtype=batch.req_pool_indices.dtype,
@@ -1946,6 +2051,145 @@ class DFlashWorker:
                 return None, proof_plan
 
             proof_cache_loc_2d = proof_cache_loc.view(bs, int(partial_width))
+            proof_mamba_indices = None
+            if has_mamba_mapping:
+                if mamba_pool is None:
+                    proof_plan = {
+                        **proof_plan,
+                        "eligible": False,
+                        "rejection_reason": "proof_mamba_pool_unavailable",
+                    }
+                    logger.warning(
+                        "DFLASH true partial proof-request forward rejected: no mamba pool"
+                    )
+                    return None, proof_plan
+                source_mamba_indices = req_to_token_pool.get_mamba_indices(
+                    batch.req_pool_indices
+                ).to(dtype=torch.long, device=batch.req_pool_indices.device)
+                proof_mamba_indices = mamba_pool.alloc(bs)
+                if proof_mamba_indices is None:
+                    proof_plan = {
+                        **proof_plan,
+                        "eligible": False,
+                        "rejection_reason": "proof_mamba_slot_allocation_failed",
+                    }
+                    logger.warning(
+                        "DFLASH true partial proof-request forward rejected: mamba OOM"
+                    )
+                    return None, proof_plan
+                proof_mamba_indices = proof_mamba_indices.to(
+                    dtype=torch.long,
+                    device=source_mamba_indices.device,
+                )
+                mamba_pool.copy_from(source_mamba_indices, proof_mamba_indices)
+                mapping = req_to_token_pool.req_index_to_mamba_index_mapping
+                for row_index, proof_req_pool_index in enumerate(proof_req_pool_indices_cpu):
+                    proof_req_pool_index_i = int(proof_req_pool_index)
+                    saved_mamba_rows.append(
+                        (
+                            mapping,
+                            proof_req_pool_index_i,
+                            mapping[proof_req_pool_index_i].detach().clone(),
+                        )
+                    )
+                    mapping[proof_req_pool_index_i] = proof_mamba_indices[
+                        row_index
+                    ].to(dtype=mapping.dtype)
+                    source_idx_i = int(source_mamba_indices[row_index].detach().cpu())
+                    proof_idx_i = int(proof_mamba_indices[row_index].detach().cpu())
+                    mamba_state_forks.append(
+                        {
+                            "attr": "req_index_to_mamba_index_mapping",
+                            "source_req_pool_index": source_req_pool_indices[row_index],
+                            "proof_req_pool_index": proof_req_pool_index_i,
+                            "source_mamba_index": source_idx_i,
+                            "proof_mamba_index": proof_idx_i,
+                            "distinct": source_idx_i != proof_idx_i,
+                            "source_copied_to_proof": True,
+                        }
+                    )
+
+                track_mapping = getattr(
+                    req_to_token_pool,
+                    "req_index_to_mamba_ping_pong_track_buffer_mapping",
+                    None,
+                )
+                if track_mapping is not None:
+                    source_track = track_mapping[batch.req_pool_indices].to(
+                        dtype=torch.long,
+                        device=batch.req_pool_indices.device,
+                    )
+                    track_flat = source_track.reshape(-1)
+                    proof_track_flat = mamba_pool.alloc(int(track_flat.numel()))
+                    if proof_track_flat is None:
+                        proof_plan = {
+                            **proof_plan,
+                            "eligible": False,
+                            "rejection_reason": (
+                                "proof_mamba_ping_pong_slot_allocation_failed"
+                            ),
+                        }
+                        logger.warning(
+                            "DFLASH true partial proof-request forward rejected: "
+                            "mamba ping-pong OOM"
+                        )
+                        return None, proof_plan
+                    proof_track_flat = proof_track_flat.to(
+                        dtype=torch.long,
+                        device=track_flat.device,
+                    )
+                    mamba_pool.copy_from(track_flat, proof_track_flat)
+                    proof_track = proof_track_flat.view_as(source_track)
+                    for row_index, proof_req_pool_index in enumerate(
+                        proof_req_pool_indices_cpu
+                    ):
+                        proof_req_pool_index_i = int(proof_req_pool_index)
+                        saved_mamba_rows.append(
+                            (
+                                track_mapping,
+                                proof_req_pool_index_i,
+                                track_mapping[proof_req_pool_index_i]
+                                .detach()
+                                .clone(),
+                            )
+                        )
+                        track_mapping[proof_req_pool_index_i] = proof_track[
+                            row_index
+                        ].to(dtype=track_mapping.dtype)
+                        source_values = [
+                            int(item)
+                            for item in source_track[row_index]
+                            .detach()
+                            .cpu()
+                            .reshape(-1)
+                            .tolist()
+                        ]
+                        proof_values = [
+                            int(item)
+                            for item in proof_track[row_index]
+                            .detach()
+                            .cpu()
+                            .reshape(-1)
+                            .tolist()
+                        ]
+                        mamba_state_forks.append(
+                            {
+                                "attr": (
+                                    "req_index_to_mamba_ping_pong_track_buffer_mapping"
+                                ),
+                                "source_req_pool_index": source_req_pool_indices[
+                                    row_index
+                                ],
+                                "proof_req_pool_index": proof_req_pool_index_i,
+                                "source_mamba_indices": source_values,
+                                "proof_mamba_indices": proof_values,
+                                "distinct": not (
+                                    set(source_values) & set(proof_values)
+                                ),
+                                "source_copied_to_proof": True,
+                            }
+                        )
+
             max_restore_end = max(
                 int(prefix_len) + int(partial_width)
                 for prefix_len in prefix_lens_cpu
@@ -1980,37 +2224,6 @@ class DFlashWorker:
                     proof_cache_loc_2d[row_index].to(req_to_token.dtype)
                 )
 
-                for attr in (
-                    "req_index_to_mamba_index_mapping",
-                    "req_index_to_mamba_ping_pong_track_buffer_mapping",
-                ):
-                    mapping = getattr(req_to_token_pool, attr, None)
-                    if mapping is None:
-                        continue
-                    saved_mamba_rows.append(
-                        (
-                            mapping,
-                            proof_req_pool_index_i,
-                            mapping[proof_req_pool_index_i].detach().clone(),
-                        )
-                    )
-                    mapping[proof_req_pool_index_i] = mapping[source_req_pool_index_i]
-                    source_value = mapping[source_req_pool_index_i].detach().reshape(-1)
-                    proof_value = mapping[proof_req_pool_index_i].detach().reshape(-1)
-                    mamba_mapping_copies.append(
-                        {
-                            "attr": attr,
-                            "source_req_pool_index": source_req_pool_index_i,
-                            "proof_req_pool_index": proof_req_pool_index_i,
-                            "match_after_copy": bool(torch.equal(source_value, proof_value)),
-                            "value_prefix": [
-                                int(item)
-                                for item in proof_value[:16].to(device="cpu").tolist()
-                            ],
-                            "numel": int(proof_value.numel()),
-                        }
-                    )
-
             _append_recurrent_snapshot("before_partial_forward")
             partial_worker_batch = replace(
                 model_worker_batch,
@@ -2036,6 +2249,8 @@ class DFlashWorker:
                 "allocated_tail_allocation_slots": int(allocated_cache_loc.numel()),
                 "tail_allocation_width_per_request": int(allocation_width),
                 "mamba_mapping_copies": mamba_mapping_copies,
+                "mamba_state_forks": mamba_state_forks,
+                "restore_report": restore_report,
                 **(
                     {"recurrent_state_probe": recurrent_state_probe}
                     if recurrent_state_probe is not None
@@ -2057,6 +2272,30 @@ class DFlashWorker:
                 req_to_token[proof_req_pool_index, :end] = saved
             req_to_token_pool.free_slots = saved_free_slots
             allocator.restore_state(allocator_state)
+            if mamba_pool is not None and saved_mamba_free_slots is not None:
+                mamba_pool.free_slots = saved_mamba_free_slots
+            restore_report["intermediate_cache_restore"] = (
+                self._restore_true_partial_intermediate_cache(
+                    batch=batch,
+                    backup=intermediate_cache_backup,
+                )
+            )
+            try:
+                setattr(metadata_holder, "forward_metadata", saved_forward_metadata)
+                restore_report["forward_metadata_restore"] = {
+                    "present": saved_forward_metadata is not None,
+                    "restored": True,
+                }
+            except Exception as e:
+                logger.warning(
+                    "DFLASH true partial proof-request forward-metadata restore failed: %s",
+                    e,
+                )
+                restore_report["forward_metadata_restore"] = {
+                    "present": saved_forward_metadata is not None,
+                    "restored": False,
+                    "error": str(e),
+                }
             _append_recurrent_snapshot("after_restore")
 
     def _run_true_partial_verify_shadow_forward(
