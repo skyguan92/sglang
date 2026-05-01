@@ -111,7 +111,7 @@ class TritonAttnBackend(AttentionBackend):
         elif (
             model_runner.hybrid_gdn_config is not None
             or model_runner.kimi_linear_config is not None
-            or model_runner.linear_attn_model_spec is not None
+            or getattr(model_runner, "linear_attn_model_spec", None) is not None
         ):
             # For hybrid linear models, layer_id = 0 may not be full attention
             self.v_head_dim = model_runner.token_to_kv_pool.get_v_head_dim()
@@ -330,10 +330,17 @@ class TritonAttnBackend(AttentionBackend):
             max_extend_len = None
         elif forward_batch.forward_mode.is_target_verify():
             bs = len(forward_batch.req_pool_indices)
+            draft_token_num = int(
+                getattr(
+                    forward_batch.spec_info,
+                    "draft_token_num",
+                    self.num_draft_tokens,
+                )
+            )
             qo_indptr = torch.arange(
                 0,
-                (1 + bs) * self.num_draft_tokens,
-                step=self.num_draft_tokens,
+                (1 + bs) * draft_token_num,
+                step=draft_token_num,
                 dtype=torch.int32,
                 device=self.device,
             )
