@@ -1438,21 +1438,7 @@ class DFlashWorker:
                 )
                 self._warned_true_partial_verify_unsafe_guard = True
             return False
-        sampling_info = batch.sampling_info
-        if sampling_info is None:
-            return True
-        if not getattr(sampling_info, "is_all_greedy", True):
-            return False
-        if getattr(sampling_info, "has_custom_logit_processor", False):
-            return False
-        if getattr(sampling_info, "logit_bias", None) is not None:
-            return False
-        penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
-        if getattr(penalizer, "is_required", False):
-            return False
-        if getattr(batch, "has_grammar", False):
-            return False
-        return True
+        return self._is_greedy_true_partial_batch(batch)
 
     def _true_partial_proof_request_forward_enabled(self) -> bool:
         return get_bool_env_var(
@@ -1480,6 +1466,41 @@ class DFlashWorker:
         return get_bool_env_var(
             "UNIFYINFER_DFLASH_TRUE_PARTIAL_VERIFY_SHAPE_PADDED_LAYERNORM"
         )
+
+    def _true_partial_production_forward_enabled(self) -> bool:
+        return get_bool_env_var(
+            "UNIFYINFER_DFLASH_TRUE_PARTIAL_VERIFY_PRODUCTION_FORWARD"
+        )
+
+    def _true_partial_production_width(self, full_width: int) -> int:
+        raw = os.getenv("UNIFYINFER_DFLASH_TRUE_PARTIAL_VERIFY_PRODUCTION_WIDTH", "")
+        if raw.strip():
+            try:
+                return int(raw)
+            except Exception:
+                logger.warning(
+                    "Invalid UNIFYINFER_DFLASH_TRUE_PARTIAL_VERIFY_PRODUCTION_WIDTH=%r; "
+                    "falling back to half width.",
+                    raw,
+                )
+        return max(1, int(full_width) // 2)
+
+    def _is_greedy_true_partial_batch(self, batch: ScheduleBatch) -> bool:
+        sampling_info = batch.sampling_info
+        if sampling_info is None:
+            return True
+        if not getattr(sampling_info, "is_all_greedy", True):
+            return False
+        if getattr(sampling_info, "has_custom_logit_processor", False):
+            return False
+        if getattr(sampling_info, "logit_bias", None) is not None:
+            return False
+        penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
+        if getattr(penalizer, "is_required", False):
+            return False
+        if getattr(batch, "has_grammar", False):
+            return False
+        return True
 
     def _target_aux_hidden_capture_source(self) -> dict[str, Any]:
         model = getattr(self.target_worker.model_runner, "model", None)
@@ -1705,6 +1726,125 @@ class DFlashWorker:
             if mask_chunks
             else torch.empty((0,), dtype=torch.bool, device=batch.device)
         )
+
+    def _maybe_prepare_true_partial_production_verify(
+        self,
+        *,
+        batch: ScheduleBatch,
+        model_worker_batch,
+        verify_input: DFlashVerifyInput,
+    ):
+        if not self._true_partial_production_forward_enabled():
+            return model_worker_batch, verify_input, None
+
+        from unifyinfer.traces.dflash_true_partial_shadow import (
+            build_dflash_true_partial_production_forward_plan,
+        )
+
+        bs = batch.batch_size()
+        full_width = int(verify_input.draft_token_num)
+        partial_width = self._true_partial_production_width(full_width)
+        shape_padded_layernorm = (
+            self._true_partial_shape_padded_layernorm_enabled()
+            and partial_width < full_width
+        )
+        plan = build_dflash_true_partial_production_forward_plan(
+            prefix_lens=batch.seq_lens_cpu.tolist(),
+            full_width=full_width,
+            partial_width=partial_width,
+            page_size=self.page_size,
+            enabled=True,
+            greedy_only=self._is_greedy_true_partial_batch(batch),
+            shape_padded_layernorm=shape_padded_layernorm,
+        )
+        if not plan.get("eligible"):
+            logger.warning(
+                "DFLASH production partial verify rejected: reason=%s plan=%s",
+                plan.get("rejection_reason"),
+                plan,
+            )
+            return model_worker_batch, verify_input, plan
+
+        out_cache_loc = batch.out_cache_loc.view(bs, full_width)
+        partial_out_cache_loc = (
+            out_cache_loc[:, :partial_width].reshape(-1).contiguous()
+        )
+        tail_out_cache_loc = (
+            out_cache_loc[:, partial_width:].reshape(-1).contiguous()
+        )
+        if tail_out_cache_loc.numel() > 0:
+            batch.token_to_kv_pool_allocator.free(tail_out_cache_loc)
+
+        partial_spec = DFlashVerifyInput(
+            draft_token=verify_input.draft_token.view(bs, full_width)[
+                :, :partial_width
+            ]
+            .reshape(-1)
+            .contiguous(),
+            positions=verify_input.positions.view(bs, full_width)[:, :partial_width]
+            .reshape(-1)
+            .contiguous(),
+            draft_token_num=partial_width,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            num_tokens_per_batch=partial_width,
+        )
+        partial_spec.profile_step = getattr(verify_input, "profile_step", None)
+        setattr(partial_spec, "unifyinfer_dflash_shape_padded_layernorm", True)
+        setattr(
+            partial_spec,
+            "unifyinfer_dflash_shape_padded_layernorm_rows",
+            int(bs) * int(full_width),
+        )
+        setattr(
+            partial_spec,
+            "unifyinfer_dflash_shape_padded_layernorm_active_rows",
+            int(bs) * int(partial_width),
+        )
+        setattr(
+            partial_spec,
+            "unifyinfer_dflash_shape_padded_layernorm_full_width",
+            int(full_width),
+        )
+        _, build_custom_mask = resolve_dflash_verify_mask_policy(
+            self.model_runner.attn_backend
+        )
+        if build_custom_mask:
+            partial_spec.custom_mask = self._build_true_partial_verify_mask(
+                batch=batch,
+                partial_width=partial_width,
+            )
+
+        batch.input_ids = partial_spec.draft_token
+        batch.out_cache_loc = partial_out_cache_loc
+        batch.spec_info = partial_spec
+        assign_req_to_token_pool_func(
+            batch.req_pool_indices,
+            batch.req_to_token_pool.req_to_token,
+            batch.seq_lens,
+            batch.seq_lens + int(partial_width),
+            batch.out_cache_loc,
+            bs,
+        )
+        partial_worker_batch = replace(
+            model_worker_batch,
+            input_ids=partial_spec.draft_token,
+            out_cache_loc=batch.out_cache_loc,
+            spec_info=partial_spec,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+        )
+        logger.info(
+            "DFLASH production partial verify: step=%s bs=%d full_width=%d "
+            "partial_width=%d shape_padded_layernorm=%s freed_tail_slots=%d "
+            "max_commit_per_request=%d",
+            getattr(verify_input, "profile_step", None),
+            bs,
+            full_width,
+            partial_width,
+            shape_padded_layernorm,
+            int(tail_out_cache_loc.numel()),
+            int(partial_width),
+        )
+        return partial_worker_batch, partial_spec, plan
 
     def _maybe_capture_true_partial_verify_forward(
         self,
@@ -2756,6 +2896,13 @@ class DFlashWorker:
         )
 
         _profile_phase = self._dflash_profile_start()
+        model_worker_batch, verify_input, _production_partial_plan = (
+            self._maybe_prepare_true_partial_production_verify(
+                batch=batch,
+                model_worker_batch=model_worker_batch,
+                verify_input=verify_input,
+            )
+        )
         batch_result = self.target_worker.forward_batch_generation(
             model_worker_batch, is_verify=True, **kwargs
         )
