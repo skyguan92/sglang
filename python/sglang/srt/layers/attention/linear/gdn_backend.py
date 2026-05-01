@@ -1,3 +1,6 @@
+import hashlib
+import json
+import os
 from contextlib import nullcontext
 from typing import Optional, Tuple, Union
 
@@ -57,6 +60,9 @@ elif is_cpu():
 _use_unifyinfer_qwen35_trace_attn_split = get_bool_env_var(
     "UNIFYINFER_QWEN35_TRACE_ATTN_SPLIT"
 )
+_use_unifyinfer_qwen35_dflash_boundary_digests = get_bool_env_var(
+    "UNIFYINFER_QWEN35_DFLASH_BOUNDARY_DIGESTS"
+)
 _use_unifyinfer_qwen35_gdn_fused_gate_cumsum = (
     get_bool_env_var("UNIFYINFER_QWEN35_GDN_FUSED_GATE_CUMSUM")
     and get_bool_env_var("UNIFYINFER_QWEN35_FLA_DIRECT_EXTEND_NOAUTOGRAD")
@@ -78,6 +84,99 @@ def _qwen35_gdn_trace_span(name: str):
     if not _use_unifyinfer_qwen35_trace_attn_split:
         return nullcontext()
     return record_function(name)
+
+
+def _qwen35_gdn_boundary_max_rows() -> int:
+    raw = os.environ.get("UNIFYINFER_QWEN35_DFLASH_BOUNDARY_DIGEST_MAX_ROWS", "32")
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 32
+
+
+def _qwen35_gdn_digest_tensor(tensor: torch.Tensor) -> str:
+    cpu = tensor.detach().contiguous().to(device="cpu")
+    original_dtype = str(cpu.dtype)
+    raw_tensor = cpu.view(torch.uint16) if cpu.dtype == torch.bfloat16 else cpu
+    try:
+        raw_bytes = raw_tensor.numpy().tobytes()
+        digest_dtype = original_dtype
+    except Exception:
+        raw_tensor = cpu.to(torch.float32)
+        raw_bytes = raw_tensor.numpy().tobytes()
+        digest_dtype = "torch.float32_from_" + original_dtype
+    hasher = hashlib.sha256()
+    hasher.update(original_dtype.encode("utf-8"))
+    hasher.update(b"\0")
+    hasher.update(json.dumps(list(cpu.shape), separators=(",", ":")).encode("utf-8"))
+    hasher.update(b"\0")
+    hasher.update(digest_dtype.encode("utf-8"))
+    hasher.update(b"\0")
+    hasher.update(raw_bytes)
+    return "sha256:" + hasher.hexdigest()
+
+
+def _qwen35_gdn_record_boundary_digest(
+    forward_batch: Optional[ForwardBatch],
+    *,
+    layer_id: int,
+    stage: str,
+    tensor: Optional[torch.Tensor],
+) -> None:
+    if (
+        not _use_unifyinfer_qwen35_dflash_boundary_digests
+        or forward_batch is None
+        or not forward_batch.forward_mode.is_target_verify()
+        or tensor is None
+        or not isinstance(tensor, torch.Tensor)
+        or tensor.ndim == 0
+    ):
+        return
+    probe_layers = getattr(
+        forward_batch,
+        "_unifyinfer_qwen35_dflash_boundary_probe_layers",
+        None,
+    )
+    if not isinstance(probe_layers, set) or int(layer_id) not in probe_layers:
+        return
+
+    max_rows = _qwen35_gdn_boundary_max_rows()
+    if max_rows <= 0:
+        return
+    view = tensor.detach().reshape(int(tensor.shape[0]), -1)
+    rows = min(int(view.shape[0]), max_rows)
+    records = getattr(
+        forward_batch,
+        "_unifyinfer_qwen35_dflash_boundary_digests",
+        None,
+    )
+    if records is None:
+        records = []
+        setattr(forward_batch, "_unifyinfer_qwen35_dflash_boundary_digests", records)
+    records.append(
+        {
+            "layer_id": int(layer_id),
+            "stage": str(stage),
+            "shape": [int(dim) for dim in tensor.shape],
+            "dtype": str(tensor.dtype),
+            "rows_recorded": rows,
+            "row_digests": [
+                _qwen35_gdn_digest_tensor(view[row_index])
+                for row_index in range(rows)
+            ],
+        }
+    )
+
+
+def _qwen35_gdn_index_rows(
+    tensor: Optional[torch.Tensor],
+    indices: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    if tensor is None or not isinstance(tensor, torch.Tensor):
+        return None
+    if indices is None or not isinstance(indices, torch.Tensor) or indices.numel() == 0:
+        return None
+    return tensor.index_select(0, indices.detach().to(device=tensor.device, dtype=torch.long))
 
 
 class GDNKernelDispatcher:
@@ -489,6 +588,65 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if is_target_verify:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
+            target_cache_indices = cache_indices[:batch_size]
+            target_intermediate_state_indices = intermediate_state_indices[:batch_size]
+            _qwen35_gdn_record_boundary_digest(
+                forward_batch,
+                layer_id=int(layer.layer_id),
+                stage="linear_attn_core_cache_indices",
+                tensor=target_cache_indices,
+            )
+            _qwen35_gdn_record_boundary_digest(
+                forward_batch,
+                layer_id=int(layer.layer_id),
+                stage="linear_attn_core_query_start_loc",
+                tensor=query_start_loc,
+            )
+            _qwen35_gdn_record_boundary_digest(
+                forward_batch,
+                layer_id=int(layer.layer_id),
+                stage="linear_attn_core_intermediate_state_indices",
+                tensor=target_intermediate_state_indices,
+            )
+            _qwen35_gdn_record_boundary_digest(
+                forward_batch,
+                layer_id=int(layer.layer_id),
+                stage="linear_attn_core_retrieve_next_token",
+                tensor=retrieve_next_token,
+            )
+            _qwen35_gdn_record_boundary_digest(
+                forward_batch,
+                layer_id=int(layer.layer_id),
+                stage="linear_attn_core_retrieve_next_sibling",
+                tensor=retrieve_next_sibling,
+            )
+            _qwen35_gdn_record_boundary_digest(
+                forward_batch,
+                layer_id=int(layer.layer_id),
+                stage="linear_attn_core_retrieve_parent_token",
+                tensor=retrieve_parent_token,
+            )
+            _qwen35_gdn_record_boundary_digest(
+                forward_batch,
+                layer_id=int(layer.layer_id),
+                stage="linear_attn_core_conv_state",
+                tensor=_qwen35_gdn_index_rows(conv_states, target_cache_indices),
+            )
+            _qwen35_gdn_record_boundary_digest(
+                forward_batch,
+                layer_id=int(layer.layer_id),
+                stage="linear_attn_core_initial_ssm_state",
+                tensor=_qwen35_gdn_index_rows(ssm_states, target_cache_indices),
+            )
+            _qwen35_gdn_record_boundary_digest(
+                forward_batch,
+                layer_id=int(layer.layer_id),
+                stage="linear_attn_core_intermediate_ssm_state",
+                tensor=_qwen35_gdn_index_rows(
+                    intermediate_state_cache,
+                    target_intermediate_state_indices,
+                ),
+            )
             mixed_qkv_reshaped = mixed_qkv.view(
                 batch_size, draft_token_num, -1
             ).transpose(1, 2)
@@ -507,6 +665,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     retrieve_parent_token=retrieve_parent_token,
                 )
             mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
+            _qwen35_gdn_record_boundary_digest(
+                forward_batch,
+                layer_id=int(layer.layer_id),
+                stage="linear_attn_core_conv_mixed_qkv",
+                tensor=mixed_qkv,
+            )
         else:
             mixed_qkv = mixed_qkv.transpose(0, 1)
             if getattr(forward_metadata, "has_mamba_track_mask", False):
@@ -540,6 +704,25 @@ class GDNAttnBackend(MambaAttnBackendBase):
         query = query.view(1, actual_seq_len, layer.num_q_heads, layer.head_q_dim)
         key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
         value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
+        if is_target_verify:
+            _qwen35_gdn_record_boundary_digest(
+                forward_batch,
+                layer_id=int(layer.layer_id),
+                stage="linear_attn_core_query",
+                tensor=query.squeeze(0),
+            )
+            _qwen35_gdn_record_boundary_digest(
+                forward_batch,
+                layer_id=int(layer.layer_id),
+                stage="linear_attn_core_key",
+                tensor=key.squeeze(0),
+            )
+            _qwen35_gdn_record_boundary_digest(
+                forward_batch,
+                layer_id=int(layer.layer_id),
+                stage="linear_attn_core_value",
+                tensor=value.squeeze(0),
+            )
 
         if is_target_verify:
             with _qwen35_gdn_trace_span("_qwen35_gdncore_dispatch"):
@@ -559,6 +742,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     cache_steps=forward_batch.spec_info.draft_token_num,
                     retrieve_parent_token=retrieve_parent_token,
                 )
+            _qwen35_gdn_record_boundary_digest(
+                forward_batch,
+                layer_id=int(layer.layer_id),
+                stage="linear_attn_core_kernel_output",
+                tensor=core_attn_out.squeeze(0)
+                if core_attn_out.ndim >= 4 and core_attn_out.shape[0] == 1
+                else core_attn_out,
+            )
         else:
             has_mamba_track_mask = getattr(
                 forward_metadata, "has_mamba_track_mask", False

@@ -1704,6 +1704,7 @@ class DFlashWorker:
         verify_input: DFlashVerifyInput,
         logits_output,
         forward_kwargs: dict,
+        pre_verify_recurrent_seed: dict[str, Any] | None = None,
     ) -> None:
         if not self._supports_true_partial_verify_capture(batch):
             return
@@ -1764,6 +1765,7 @@ class DFlashWorker:
                         partial_spec=partial_spec,
                         partial_width=partial_width,
                         forward_kwargs=forward_kwargs,
+                        pre_verify_recurrent_seed=pre_verify_recurrent_seed,
                     )
                 )
                 if partial_result is None:
@@ -1964,6 +1966,121 @@ class DFlashWorker:
             )
             return {"present": True, "restored": False, "error": str(e)}
 
+    def _backup_true_partial_recurrent_seed(
+        self,
+        *,
+        batch: ScheduleBatch,
+        bs: int,
+    ) -> dict[str, Any] | None:
+        req_to_token_pool = batch.req_to_token_pool
+        mamba_pool = getattr(req_to_token_pool, "mamba_pool", None)
+        if (
+            mamba_pool is None
+            or not hasattr(req_to_token_pool, "get_speculative_mamba2_params_all_layers")
+            or not hasattr(req_to_token_pool, "get_mamba_indices")
+        ):
+            return None
+        try:
+            source_mamba_indices = req_to_token_pool.get_mamba_indices(
+                batch.req_pool_indices
+            ).to(dtype=torch.long)
+            caches = req_to_token_pool.get_speculative_mamba2_params_all_layers()
+            intermediate_indices = torch.arange(
+                int(bs),
+                dtype=torch.long,
+                device=caches.intermediate_ssm.device,
+            )
+            backup: dict[str, Any] = {
+                "present": True,
+                "source_mamba_indices": source_mamba_indices.detach().clone(),
+                "intermediate_indices": intermediate_indices,
+                "conv": [
+                    (idx, tensor[:, source_mamba_indices].detach().clone())
+                    for idx, tensor in enumerate(getattr(caches, "conv", []))
+                ],
+                "temporal": caches.temporal[:, source_mamba_indices]
+                .detach()
+                .clone(),
+                "intermediate_ssm": caches.intermediate_ssm[:, intermediate_indices]
+                .detach()
+                .clone(),
+                "intermediate_conv_window": [],
+            }
+            intermediate_conv_cache = getattr(caches, "intermediate_conv_window", None)
+            if intermediate_conv_cache is not None:
+                backup["intermediate_conv_window"] = [
+                    (idx, tensor[:, intermediate_indices].detach().clone())
+                    for idx, tensor in enumerate(intermediate_conv_cache)
+                ]
+            return backup
+        except Exception as e:
+            logger.warning(
+                "DFLASH true partial proof-request recurrent seed backup failed: %s",
+                e,
+            )
+            return {"present": True, "error": str(e)}
+
+    def _seed_true_partial_recurrent_state(
+        self,
+        *,
+        batch: ScheduleBatch,
+        backup: dict[str, Any] | None,
+        proof_mamba_indices: torch.Tensor | None,
+    ) -> dict[str, Any]:
+        if not backup or backup.get("error"):
+            return {"present": bool(backup), "seeded": False, "error": backup.get("error") if backup else None}
+        if proof_mamba_indices is None:
+            return {"present": True, "seeded": False, "error": "proof_mamba_indices_missing"}
+        try:
+            caches = batch.req_to_token_pool.get_speculative_mamba2_params_all_layers()
+            proof_indices = proof_mamba_indices.to(
+                device=caches.temporal.device,
+                dtype=torch.long,
+            )
+            for idx, saved in backup.get("conv", []):
+                caches.conv[int(idx)][:, proof_indices] = saved.to(
+                    device=caches.conv[int(idx)].device,
+                    dtype=caches.conv[int(idx)].dtype,
+                )
+            caches.temporal[:, proof_indices] = backup["temporal"].to(
+                device=caches.temporal.device,
+                dtype=caches.temporal.dtype,
+            )
+
+            intermediate_indices = backup["intermediate_indices"].to(
+                device=caches.intermediate_ssm.device,
+                dtype=torch.long,
+            )
+            caches.intermediate_ssm[:, intermediate_indices] = backup[
+                "intermediate_ssm"
+            ].to(
+                device=caches.intermediate_ssm.device,
+                dtype=caches.intermediate_ssm.dtype,
+            )
+            intermediate_conv_cache = getattr(caches, "intermediate_conv_window", None)
+            if intermediate_conv_cache is not None:
+                for idx, saved in backup.get("intermediate_conv_window", []):
+                    intermediate_conv_cache[int(idx)][:, intermediate_indices] = saved.to(
+                        device=intermediate_conv_cache[int(idx)].device,
+                        dtype=intermediate_conv_cache[int(idx)].dtype,
+                    )
+            return {
+                "present": True,
+                "seeded": True,
+                "proof_mamba_indices": [
+                    int(item) for item in proof_indices.detach().cpu().tolist()
+                ],
+                "intermediate_indices": [
+                    int(item) for item in intermediate_indices.detach().cpu().tolist()
+                ],
+            }
+        except Exception as e:
+            logger.warning(
+                "DFLASH true partial proof-request recurrent seed restore failed: %s",
+                e,
+            )
+            return {"present": True, "seeded": False, "error": str(e)}
+
     def _run_true_partial_verify_proof_request_forward(
         self,
         *,
@@ -1972,6 +2089,7 @@ class DFlashWorker:
         partial_spec: DFlashVerifyInput,
         partial_width: int,
         forward_kwargs: dict,
+        pre_verify_recurrent_seed: dict[str, Any] | None = None,
     ):
         """Run the proof forward under a temporary scratch req-pool identity."""
 
@@ -2047,6 +2165,7 @@ class DFlashWorker:
         restore_report: dict[str, Any] = {}
         metadata_holder = self._linear_forward_metadata_holder()
         saved_forward_metadata = getattr(metadata_holder, "forward_metadata", None)
+        seed_report: dict[str, Any] = {"present": False, "seeded": False}
         proof_req_pool_indices = torch.tensor(
             proof_req_pool_indices_cpu,
             dtype=batch.req_pool_indices.dtype,
@@ -2267,6 +2386,11 @@ class DFlashWorker:
                     proof_cache_loc_2d[row_index].to(req_to_token.dtype)
                 )
 
+            seed_report = self._seed_true_partial_recurrent_state(
+                batch=batch,
+                backup=pre_verify_recurrent_seed,
+                proof_mamba_indices=proof_mamba_indices,
+            )
             _append_recurrent_snapshot("before_partial_forward")
             partial_worker_batch = replace(
                 model_worker_batch,
@@ -2293,6 +2417,7 @@ class DFlashWorker:
                 "tail_allocation_width_per_request": int(allocation_width),
                 "mamba_mapping_copies": mamba_mapping_copies,
                 "mamba_state_forks": mamba_state_forks,
+                "pre_verify_recurrent_seed": seed_report,
                 "restore_report": restore_report,
                 **(
                     {"recurrent_state_probe": recurrent_state_probe}
@@ -2553,6 +2678,18 @@ class DFlashWorker:
         seq_lens_pre_verify = (
             batch.seq_lens.clone() if need_mamba_verify_commit else None
         )
+        pre_verify_recurrent_seed = (
+            self._backup_true_partial_recurrent_seed(
+                batch=batch,
+                bs=batch.batch_size(),
+            )
+            if (
+                self._true_partial_proof_request_forward_enabled()
+                and self._supports_true_partial_verify_capture(batch)
+                and batch.batch_size() == 1
+            )
+            else None
+        )
 
         _profile_phase = self._dflash_profile_start()
         batch_result = self.target_worker.forward_batch_generation(
@@ -2569,6 +2706,7 @@ class DFlashWorker:
             verify_input=verify_input,
             logits_output=logits_output,
             forward_kwargs=kwargs,
+            pre_verify_recurrent_seed=pre_verify_recurrent_seed,
         )
 
         _profile_phase = self._dflash_profile_start()
