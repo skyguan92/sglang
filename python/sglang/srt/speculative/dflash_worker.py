@@ -1476,6 +1476,11 @@ class DFlashWorker:
             "UNIFYINFER_DFLASH_TRUE_PARTIAL_VERIFY_FULL_WIDTH_SHAPE_CONTROL"
         )
 
+    def _true_partial_shape_padded_layernorm_enabled(self) -> bool:
+        return get_bool_env_var(
+            "UNIFYINFER_DFLASH_TRUE_PARTIAL_VERIFY_SHAPE_PADDED_LAYERNORM"
+        )
+
     def _target_aux_hidden_capture_source(self) -> dict[str, Any]:
         model = getattr(self.target_worker.model_runner, "model", None)
         candidates = [
@@ -1748,6 +1753,11 @@ class DFlashWorker:
             proof_forward_width = (
                 full_width if full_width_shape_control else greedy_partial_width
             )
+            shape_padded_layernorm = (
+                self._true_partial_shape_padded_layernorm_enabled()
+                and not full_width_shape_control
+                and proof_forward_width < full_width
+            )
 
             positions = verify_input.positions.view(bs, full_width)
             full_positions_cpu = positions.detach().to(device="cpu", dtype=torch.int64)
@@ -1761,6 +1771,27 @@ class DFlashWorker:
                 capture_hidden_mode=CaptureHiddenMode.FULL,
                 num_tokens_per_batch=proof_forward_width,
             )
+            if shape_padded_layernorm:
+                setattr(
+                    partial_spec,
+                    "unifyinfer_dflash_shape_padded_layernorm",
+                    True,
+                )
+                setattr(
+                    partial_spec,
+                    "unifyinfer_dflash_shape_padded_layernorm_rows",
+                    int(bs) * int(full_width),
+                )
+                setattr(
+                    partial_spec,
+                    "unifyinfer_dflash_shape_padded_layernorm_active_rows",
+                    int(bs) * int(proof_forward_width),
+                )
+                setattr(
+                    partial_spec,
+                    "unifyinfer_dflash_shape_padded_layernorm_full_width",
+                    int(full_width),
+                )
             _, build_custom_mask = resolve_dflash_verify_mask_policy(
                 self.model_runner.attn_backend
             )
@@ -1867,6 +1898,17 @@ class DFlashWorker:
                     "greedy_partial_width": int(greedy_partial_width),
                     "proof_forward_width": int(proof_forward_width),
                     "full_width_shape_control": bool(full_width_shape_control),
+                    "shape_padded_layernorm": bool(shape_padded_layernorm),
+                    "shape_padded_layernorm_rows": (
+                        int(bs) * int(full_width)
+                        if shape_padded_layernorm
+                        else None
+                    ),
+                    "shape_padded_layernorm_active_rows": (
+                        int(bs) * int(proof_forward_width)
+                        if shape_padded_layernorm
+                        else None
+                    ),
                     "req_pool_indices": [
                         int(item) for item in batch.req_pool_indices.detach().cpu().tolist()
                     ],

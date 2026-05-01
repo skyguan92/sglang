@@ -79,6 +79,94 @@ _is_sm90_supported = _is_cuda and is_sm90_supported()
 _is_sm100_supported = _is_cuda and is_sm100_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 _is_gfx95_supported = is_gfx95_supported()
+
+
+def _unifyinfer_dflash_shape_padded_layernorm_rows(
+    forward_batch: ForwardBatch,
+    hidden_states: torch.Tensor,
+) -> int | None:
+    spec_info = getattr(forward_batch, "spec_info", None)
+    if spec_info is None or not bool(
+        getattr(spec_info, "unifyinfer_dflash_shape_padded_layernorm", False)
+    ):
+        return None
+    forward_mode = getattr(forward_batch, "forward_mode", None)
+    if forward_mode is None or not forward_mode.is_target_verify():
+        return None
+    if not isinstance(hidden_states, torch.Tensor) or hidden_states.ndim < 2:
+        return None
+    try:
+        target_rows = int(
+            getattr(spec_info, "unifyinfer_dflash_shape_padded_layernorm_rows", 0)
+        )
+    except Exception:
+        return None
+    active_rows = int(hidden_states.shape[0])
+    if target_rows <= active_rows:
+        return None
+    return target_rows
+
+
+def _unifyinfer_dflash_shape_padded_layernorm(
+    layernorm: torch.nn.Module,
+    hidden_states: torch.Tensor,
+    residual: Optional[torch.Tensor] = None,
+    post_residual_addition: Optional[torch.Tensor] = None,
+    forward_batch: Optional[ForwardBatch] = None,
+):
+    target_rows = (
+        _unifyinfer_dflash_shape_padded_layernorm_rows(forward_batch, hidden_states)
+        if forward_batch is not None
+        else None
+    )
+    if target_rows is None:
+        if post_residual_addition is not None:
+            return layernorm(hidden_states, residual, post_residual_addition)
+        if residual is not None:
+            return layernorm(hidden_states, residual)
+        return layernorm(hidden_states)
+
+    active_rows = int(hidden_states.shape[0])
+    padded_hidden = hidden_states.new_zeros((target_rows, *hidden_states.shape[1:]))
+    padded_hidden[:active_rows].copy_(hidden_states)
+
+    padded_residual = None
+    if residual is not None:
+        if not isinstance(residual, torch.Tensor) or residual.shape[0] != active_rows:
+            if post_residual_addition is not None:
+                return layernorm(hidden_states, residual, post_residual_addition)
+            return layernorm(hidden_states, residual)
+        padded_residual = residual.new_zeros((target_rows, *residual.shape[1:]))
+        padded_residual[:active_rows].copy_(residual)
+
+    padded_post_residual = None
+    if post_residual_addition is not None:
+        if (
+            not isinstance(post_residual_addition, torch.Tensor)
+            or post_residual_addition.shape[0] != active_rows
+        ):
+            return layernorm(hidden_states, residual, post_residual_addition)
+        padded_post_residual = post_residual_addition.new_zeros(
+            (target_rows, *post_residual_addition.shape[1:])
+        )
+        padded_post_residual[:active_rows].copy_(post_residual_addition)
+
+    if padded_post_residual is not None:
+        result = layernorm(padded_hidden, padded_residual, padded_post_residual)
+    elif padded_residual is not None:
+        result = layernorm(padded_hidden, padded_residual)
+    else:
+        result = layernorm(padded_hidden)
+
+    if isinstance(result, tuple):
+        hidden_out, residual_out = result
+        residual_out = (
+            residual_out[:active_rows].contiguous()
+            if isinstance(residual_out, torch.Tensor)
+            else residual_out
+        )
+        return hidden_out[:active_rows].contiguous(), residual_out
+    return result[:active_rows].contiguous()
 _is_npu = is_npu()
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 
@@ -523,8 +611,13 @@ class LayerCommunicator:
                     )
                 else:
                     hidden_states = moe_tensor_model_parallel_all_reduce(hidden_states)
-                    hidden_states, residual = self.input_layernorm(
-                        hidden_states, residual
+                    hidden_states, residual = (
+                        _unifyinfer_dflash_shape_padded_layernorm(
+                            self.input_layernorm,
+                            hidden_states,
+                            residual,
+                            forward_batch=forward_batch,
+                        )
                     )
             else:
                 if residual is None:
@@ -573,7 +666,11 @@ class LayerCommunicator:
                         )
 
                     else:
-                        hidden_states = self.input_layernorm(hidden_states)
+                        hidden_states = _unifyinfer_dflash_shape_padded_layernorm(
+                            self.input_layernorm,
+                            hidden_states,
+                            forward_batch=forward_batch,
+                        )
                 else:
                     if _use_aiter and _is_gfx95_supported and ("mxfp4" in quant_format):
                         hidden_states, *_, residual = fused_rms_mxfp4_quant(
@@ -620,10 +717,14 @@ class LayerCommunicator:
                             residual=residual,
                         )
                     else:
-                        hidden_states, residual = self.input_layernorm(
-                            hidden_states,
-                            residual,
-                            post_residual_addition,
+                        hidden_states, residual = (
+                            _unifyinfer_dflash_shape_padded_layernorm(
+                                self.input_layernorm,
+                                hidden_states,
+                                residual,
+                                post_residual_addition,
+                                forward_batch=forward_batch,
+                            )
                         )
 
         hidden_states = self._communicate_simple_fn(
@@ -913,7 +1014,12 @@ class CommunicateWithAllReduceAndLayerNormFn:
     ):
         # TODO move these `if shape != 0` into LayerNorm itself
         if hidden_states.shape[0] != 0:
-            hidden_states, residual = layernorm(hidden_states, residual)
+            hidden_states, residual = _unifyinfer_dflash_shape_padded_layernorm(
+                layernorm,
+                hidden_states,
+                residual,
+                forward_batch=forward_batch,
+            )
         return hidden_states, residual
 
     @staticmethod
@@ -948,7 +1054,14 @@ class CommunicateWithAllReduceAndLayerNormFn:
                     get_tp_group(),
                     disabled=not is_allocation_symmetric(),
                 ):
-                    hidden_states, residual = layernorm(hidden_states, residual)
+                    hidden_states, residual = (
+                        _unifyinfer_dflash_shape_padded_layernorm(
+                            layernorm,
+                            hidden_states,
+                            residual,
+                            forward_batch=forward_batch,
+                        )
+                    )
             elif context.attn_tp_rank == 0:
                 hidden_states += residual
 
@@ -961,7 +1074,11 @@ class CommunicateWithAllReduceAndLayerNormFn:
             if not use_layer_norm_before_gather:
                 dp_scatter(residual, hidden_states, forward_batch)
                 if hidden_states.shape[0] != 0:
-                    hidden_states = layernorm(hidden_states)
+                    hidden_states = _unifyinfer_dflash_shape_padded_layernorm(
+                        layernorm,
+                        hidden_states,
+                        forward_batch=forward_batch,
+                    )
         else:
             handled = False
             if (
@@ -979,7 +1096,12 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 )
                 if _is_npu and context.cache is not None:
                     _ = prepare_weight_cache(hidden_states, context.cache)
-                hidden_states, residual = layernorm(hidden_states, residual)
+                hidden_states, residual = _unifyinfer_dflash_shape_padded_layernorm(
+                    layernorm,
+                    hidden_states,
+                    residual,
+                    forward_batch=forward_batch,
+                )
         return hidden_states, residual
 
     @staticmethod
@@ -1000,7 +1122,12 @@ class CommunicateWithAllReduceAndLayerNormFn:
         if residual_input_mode == ScatterMode.TP_ATTN_FULL:
             residual = residual.tensor_split(context.attn_tp_size)[context.attn_tp_rank]
         if hidden_states.shape[0] != 0:
-            hidden_states, residual = layernorm(hidden_states, residual)
+            hidden_states, residual = _unifyinfer_dflash_shape_padded_layernorm(
+                layernorm,
+                hidden_states,
+                residual,
+                forward_batch=forward_batch,
+            )
         return hidden_states, residual
 
     @staticmethod

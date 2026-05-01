@@ -435,6 +435,74 @@ def _qwen35_dflash_record_boundary_digest(
     )
 
 
+def _qwen35_dflash_shape_padded_layernorm_rows(
+    forward_batch: Optional[ForwardBatch],
+    hidden_states: Optional[torch.Tensor],
+) -> int | None:
+    spec_info = getattr(forward_batch, "spec_info", None)
+    if spec_info is None or not bool(
+        getattr(spec_info, "unifyinfer_dflash_shape_padded_layernorm", False)
+    ):
+        return None
+    if (
+        forward_batch is None
+        or not forward_batch.forward_mode.is_target_verify()
+        or hidden_states is None
+        or not isinstance(hidden_states, torch.Tensor)
+        or hidden_states.ndim < 2
+    ):
+        return None
+    try:
+        target_rows = int(
+            getattr(spec_info, "unifyinfer_dflash_shape_padded_layernorm_rows", 0)
+        )
+    except Exception:
+        return None
+    active_rows = int(hidden_states.shape[0])
+    if target_rows <= active_rows:
+        return None
+    return target_rows
+
+
+def _qwen35_dflash_forward_native_layernorm_for_digest(
+    forward_batch: Optional[ForwardBatch],
+    *,
+    layernorm: torch.nn.Module,
+    hidden_states: torch.Tensor,
+    residual: Optional[torch.Tensor],
+):
+    target_rows = _qwen35_dflash_shape_padded_layernorm_rows(
+        forward_batch,
+        hidden_states,
+    )
+    if target_rows is None:
+        return layernorm.forward_native(hidden_states, residual)
+
+    active_rows = int(hidden_states.shape[0])
+    hidden_padded = hidden_states.new_zeros((target_rows, *hidden_states.shape[1:]))
+    hidden_padded[:active_rows].copy_(hidden_states)
+    residual_padded = None
+    if residual is not None:
+        if not isinstance(residual, torch.Tensor) or residual.shape[0] != active_rows:
+            return layernorm.forward_native(hidden_states, residual)
+        residual_padded = residual.new_zeros((target_rows, *residual.shape[1:]))
+        residual_padded[:active_rows].copy_(residual)
+
+    native = layernorm.forward_native(hidden_padded, residual_padded)
+    if isinstance(native, tuple):
+        native_hidden, native_residual = native
+        native_residual = (
+            native_residual[:active_rows].contiguous()
+            if isinstance(native_residual, torch.Tensor)
+            else native_residual
+        )
+        return (
+            native_hidden[:active_rows].contiguous(),
+            native_residual,
+        )
+    return native[:active_rows].contiguous()
+
+
 def _qwen35_dflash_record_native_layernorm_digest(
     forward_batch: Optional[ForwardBatch],
     *,
@@ -459,7 +527,12 @@ def _qwen35_dflash_record_native_layernorm_digest(
                 if residual is not None and isinstance(residual, torch.Tensor)
                 else None
             )
-            native = layernorm.forward_native(hidden_clone, residual_clone)
+            native = _qwen35_dflash_forward_native_layernorm_for_digest(
+                forward_batch,
+                layernorm=layernorm,
+                hidden_states=hidden_clone,
+                residual=residual_clone,
+            )
         if isinstance(native, tuple):
             native_hidden, native_residual = native
         else:
