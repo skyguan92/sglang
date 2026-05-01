@@ -1530,6 +1530,8 @@ class DFlashWorker:
                 return
 
             positions = verify_input.positions.view(bs, full_width)
+            full_positions_cpu = positions.detach().to(device="cpu", dtype=torch.int64)
+            partial_positions_cpu = full_positions_cpu[:, :partial_width].contiguous()
             partial_spec = DFlashVerifyInput(
                 draft_token=candidates[:, :partial_width].reshape(-1).contiguous(),
                 positions=positions[:, :partial_width].reshape(-1).contiguous(),
@@ -1617,6 +1619,19 @@ class DFlashWorker:
                 source={
                     "hook": "DFlashWorker._maybe_capture_true_partial_verify_forward",
                     "trace_env": "UNIFYINFER_DFLASH_TRUE_PARTIAL_VERIFY_CAPTURE_JSONL",
+                    "forward_mode": str(batch.forward_mode),
+                    "seq_lens_before_verify": [
+                        int(item) for item in batch.seq_lens_cpu.tolist()
+                    ],
+                    "full_positions": full_positions_cpu.tolist(),
+                    "partial_positions": partial_positions_cpu.tolist(),
+                    "partial_positions_match_full_prefix": bool(
+                        torch.equal(full_positions_cpu[:, :partial_width], partial_positions_cpu)
+                    ),
+                    "req_pool_indices": [
+                        int(item) for item in batch.req_pool_indices.detach().cpu().tolist()
+                    ],
+                    "out_cache_loc_shape": list(model_worker_batch.out_cache_loc.shape),
                     "shadow_forward_plan": shadow_plan,
                 },
             )
@@ -1698,6 +1713,7 @@ class DFlashWorker:
         saved_free_slots = list(req_to_token_pool.free_slots)
         saved_req_rows: list[tuple[int, int, torch.Tensor]] = []
         saved_mamba_rows: list[tuple[torch.Tensor, int, torch.Tensor]] = []
+        mamba_mapping_copies: list[dict] = []
         proof_req_pool_indices = torch.tensor(
             proof_req_pool_indices_cpu,
             dtype=batch.req_pool_indices.dtype,
@@ -1774,6 +1790,21 @@ class DFlashWorker:
                         )
                     )
                     mapping[proof_req_pool_index_i] = mapping[source_req_pool_index_i]
+                    source_value = mapping[source_req_pool_index_i].detach().reshape(-1)
+                    proof_value = mapping[proof_req_pool_index_i].detach().reshape(-1)
+                    mamba_mapping_copies.append(
+                        {
+                            "attr": attr,
+                            "source_req_pool_index": source_req_pool_index_i,
+                            "proof_req_pool_index": proof_req_pool_index_i,
+                            "match_after_copy": bool(torch.equal(source_value, proof_value)),
+                            "value_prefix": [
+                                int(item)
+                                for item in proof_value[:16].to(device="cpu").tolist()
+                            ],
+                            "numel": int(proof_value.numel()),
+                        }
+                    )
 
             partial_worker_batch = replace(
                 model_worker_batch,
@@ -1792,10 +1823,12 @@ class DFlashWorker:
                 torch.cuda.synchronize()
             return partial_result, {
                 **proof_plan,
+                "source_req_pool_indices": source_req_pool_indices,
                 "proof_req_pool_indices": proof_req_pool_indices_cpu,
                 "allocated_tail_slots": int(proof_cache_loc.numel()),
                 "allocated_tail_allocation_slots": int(allocated_cache_loc.numel()),
                 "tail_allocation_width_per_request": int(allocation_width),
+                "mamba_mapping_copies": mamba_mapping_copies,
             }
         finally:
             if is_cuda_alike():
