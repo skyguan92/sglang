@@ -1471,6 +1471,29 @@ class DFlashWorker:
             "UNIFYINFER_DFLASH_TRUE_PARTIAL_VERIFY_STATE_DIGESTS"
         )
 
+    def _target_aux_hidden_capture_source(self) -> dict[str, Any]:
+        model = getattr(self.target_worker.model_runner, "model", None)
+        candidates = [
+            model,
+            getattr(model, "model", None),
+            getattr(model, "language_model", None),
+        ]
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            layer_ids = getattr(candidate, "layers_to_capture", None)
+            hidden_size = getattr(candidate, "hidden_size", None)
+            if layer_ids is None or hidden_size is None:
+                continue
+            try:
+                return {
+                    "aux_hidden_layer_ids": [int(item) for item in layer_ids],
+                    "aux_hidden_size": int(hidden_size),
+                }
+            except Exception:
+                continue
+        return {}
+
     def _small_tensor_list(self, tensor: Optional[torch.Tensor], *, limit: int = 32):
         if tensor is None:
             return None
@@ -1817,6 +1840,7 @@ class DFlashWorker:
                         int(item) for item in batch.req_pool_indices.detach().cpu().tolist()
                     ],
                     "out_cache_loc_shape": list(model_worker_batch.out_cache_loc.shape),
+                    **self._target_aux_hidden_capture_source(),
                     "shadow_forward_plan": shadow_plan,
                 },
             )
