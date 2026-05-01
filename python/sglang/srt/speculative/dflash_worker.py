@@ -4,6 +4,7 @@ import math
 import os
 import time
 from copy import deepcopy
+from dataclasses import replace
 from typing import Optional, Union
 
 import torch
@@ -26,6 +27,7 @@ from sglang.srt.server_args import (
 from sglang.srt.speculative.dflash_info import DFlashDraftInput, DFlashVerifyInput
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_use_fused_qkv_proj,
+    compute_dflash_accept_len_and_bonus,
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
     resolve_dflash_verify_mask_policy,
@@ -132,6 +134,7 @@ class DFlashWorker:
             os.getenv("UNIFYINFER_DFLASH_TRACE_LIVE_HANDLE_MAX_EVENTS", "1")
         )
         self._trace_live_handle_emitted = 0
+        self._warned_true_partial_verify_unsafe_guard = False
 
         # Draft runner (separate KV cache + attention backend).
         # Without draft windowing, the draft worker aliases the target request->token
@@ -1391,6 +1394,167 @@ class DFlashWorker:
             model=self.target_worker.model_runner.model,
         )
 
+    def _supports_true_partial_verify_capture(self, batch: ScheduleBatch) -> bool:
+        capture_path = os.getenv("UNIFYINFER_DFLASH_TRUE_PARTIAL_VERIFY_CAPTURE_JSONL")
+        if not capture_path or capture_path.lower() in ("", "0", "false", "no", "off"):
+            return False
+        allow_unsafe = os.getenv(
+            "UNIFYINFER_DFLASH_TRUE_PARTIAL_VERIFY_ALLOW_INPLACE_FORWARD"
+        )
+        if not allow_unsafe or allow_unsafe.lower() in ("", "0", "false", "no", "off"):
+            if not self._warned_true_partial_verify_unsafe_guard:
+                logger.warning(
+                    "DFLASH true partial verify capture requested, but the current "
+                    "in-place partial-forward prototype is unsafe on ROCm. Set "
+                    "UNIFYINFER_DFLASH_TRUE_PARTIAL_VERIFY_ALLOW_INPLACE_FORWARD=1 "
+                    "only for explicit crash-repro experiments."
+                )
+                self._warned_true_partial_verify_unsafe_guard = True
+            return False
+        sampling_info = batch.sampling_info
+        if sampling_info is None:
+            return True
+        if not getattr(sampling_info, "is_all_greedy", True):
+            return False
+        if getattr(sampling_info, "has_custom_logit_processor", False):
+            return False
+        if getattr(sampling_info, "logit_bias", None) is not None:
+            return False
+        penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
+        if getattr(penalizer, "is_required", False):
+            return False
+        if getattr(batch, "has_grammar", False):
+            return False
+        return True
+
+    def _build_true_partial_verify_mask(
+        self,
+        *,
+        batch: ScheduleBatch,
+        partial_width: int,
+    ) -> torch.Tensor:
+        mask_chunks = []
+        q_idx = torch.arange(
+            partial_width, device=batch.device, dtype=torch.int32
+        ).unsqueeze(1)
+        for prefix_len in batch.seq_lens_cpu.tolist():
+            prefix_len_i = int(prefix_len)
+            kv_len = prefix_len_i + partial_width
+            k_idx = torch.arange(
+                kv_len, device=batch.device, dtype=torch.int32
+            ).unsqueeze(0)
+            mask_chunks.append((k_idx <= (prefix_len_i + q_idx)).flatten())
+        return (
+            torch.cat(mask_chunks, dim=0)
+            if mask_chunks
+            else torch.empty((0,), dtype=torch.bool, device=batch.device)
+        )
+
+    def _maybe_capture_true_partial_verify_forward(
+        self,
+        *,
+        batch: ScheduleBatch,
+        model_worker_batch,
+        verify_input: DFlashVerifyInput,
+        logits_output,
+        forward_kwargs: dict,
+    ) -> None:
+        if not self._supports_true_partial_verify_capture(batch):
+            return
+        try:
+            hidden = logits_output.hidden_states
+            if hidden is None:
+                return
+            bs = batch.batch_size()
+            if bs != 1:
+                logger.warning(
+                    "DFLASH true partial verify capture currently supports bs=1, got bs=%s.",
+                    bs,
+                )
+                return
+
+            full_width = int(verify_input.draft_token_num)
+            candidates = verify_input.draft_token.view(bs, full_width)
+            full_target_predict = torch.argmax(
+                logits_output.next_token_logits, dim=-1
+            ).view(bs, full_width)
+            accept_len, _ = compute_dflash_accept_len_and_bonus(
+                candidates=candidates,
+                target_predict=full_target_predict,
+            )
+            prefix_lens = (accept_len.to(torch.int64) + 1).clamp(
+                min=1,
+                max=full_width,
+            )
+            partial_width = int(prefix_lens.max().item())
+            if partial_width >= full_width:
+                # This row would be a full-width rerun, not a partial-forward proof.
+                return
+
+            positions = verify_input.positions.view(bs, full_width)
+            out_cache_loc = model_worker_batch.out_cache_loc.view(bs, full_width)
+            partial_spec = DFlashVerifyInput(
+                draft_token=candidates[:, :partial_width].reshape(-1).contiguous(),
+                positions=positions[:, :partial_width].reshape(-1).contiguous(),
+                draft_token_num=partial_width,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+                num_tokens_per_batch=partial_width,
+            )
+            _, build_custom_mask = resolve_dflash_verify_mask_policy(
+                self.model_runner.attn_backend
+            )
+            if build_custom_mask:
+                partial_spec.custom_mask = self._build_true_partial_verify_mask(
+                    batch=batch,
+                    partial_width=partial_width,
+                )
+
+            partial_worker_batch = replace(
+                model_worker_batch,
+                input_ids=partial_spec.draft_token,
+                out_cache_loc=out_cache_loc[:, :partial_width]
+                .reshape(-1)
+                .contiguous(),
+                spec_info=partial_spec,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+            )
+            partial_result = self.target_worker.forward_batch_generation(
+                partial_worker_batch,
+                is_verify=True,
+                **forward_kwargs,
+            )
+            partial_logits = partial_result.logits_output
+            partial_hidden = partial_logits.hidden_states
+            if partial_hidden is None:
+                return
+            partial_target_predict = torch.argmax(
+                partial_logits.next_token_logits, dim=-1
+            ).view(bs, partial_width)
+
+            from unifyinfer.traces.dflash_partial_verify_capture import (
+                maybe_append_dflash_true_partial_verify_capture,
+            )
+
+            maybe_append_dflash_true_partial_verify_capture(
+                candidates=candidates,
+                full_target_predict=full_target_predict,
+                full_hidden=hidden.view(bs, full_width, -1),
+                partial_target_predict=partial_target_predict,
+                partial_hidden=partial_hidden.view(bs, partial_width, -1),
+                prefix_lens=prefix_lens.detach().cpu().tolist(),
+                profile_step=getattr(verify_input, "profile_step", None),
+                req_ids=[
+                    getattr(req, "rid", getattr(req, "request_id", index))
+                    for index, req in enumerate(batch.reqs)
+                ],
+                source={
+                    "hook": "DFlashWorker._maybe_capture_true_partial_verify_forward",
+                    "trace_env": "UNIFYINFER_DFLASH_TRUE_PARTIAL_VERIFY_CAPTURE_JSONL",
+                },
+            )
+        except Exception as e:
+            logger.warning("DFLASH true partial verify capture failed: %s", e)
+
     def forward_batch_generation(
         self,
         batch: Union[ScheduleBatch, ModelWorkerBatch],
@@ -1496,6 +1660,13 @@ class DFlashWorker:
         logits_output, can_run_cuda_graph = (
             batch_result.logits_output,
             batch_result.can_run_cuda_graph,
+        )
+        self._maybe_capture_true_partial_verify_forward(
+            batch=batch,
+            model_worker_batch=model_worker_batch,
+            verify_input=verify_input,
+            logits_output=logits_output,
+            forward_kwargs=kwargs,
         )
 
         _profile_phase = self._dflash_profile_start()
