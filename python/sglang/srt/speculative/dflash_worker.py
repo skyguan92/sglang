@@ -1398,14 +1398,33 @@ class DFlashWorker:
         capture_path = os.getenv("UNIFYINFER_DFLASH_TRUE_PARTIAL_VERIFY_CAPTURE_JSONL")
         if not capture_path or capture_path.lower() in ("", "0", "false", "no", "off"):
             return False
-        allow_unsafe = os.getenv(
+        shadow_forward = get_bool_env_var(
+            "UNIFYINFER_DFLASH_TRUE_PARTIAL_VERIFY_SHADOW_FORWARD"
+        )
+        allow_restored_shadow = get_bool_env_var(
+            "UNIFYINFER_DFLASH_TRUE_PARTIAL_VERIFY_ALLOW_RESTORED_SHADOW_FORWARD"
+        )
+        allow_unsafe = get_bool_env_var(
             "UNIFYINFER_DFLASH_TRUE_PARTIAL_VERIFY_ALLOW_INPLACE_FORWARD"
         )
-        if not allow_unsafe or allow_unsafe.lower() in ("", "0", "false", "no", "off"):
+        if shadow_forward and not allow_restored_shadow:
+            if not self._warned_true_partial_verify_unsafe_guard:
+                logger.warning(
+                    "DFLASH true partial verify restored-shadow capture requested, "
+                    "but the restored same-request shadow-slot prototype is not a "
+                    "safe default on ROCm. Set "
+                    "UNIFYINFER_DFLASH_TRUE_PARTIAL_VERIFY_ALLOW_RESTORED_SHADOW_FORWARD=1 "
+                    "only for explicit crash-repro experiments."
+                )
+                self._warned_true_partial_verify_unsafe_guard = True
+            return False
+        if not shadow_forward and not allow_unsafe:
             if not self._warned_true_partial_verify_unsafe_guard:
                 logger.warning(
                     "DFLASH true partial verify capture requested, but the current "
-                    "in-place partial-forward prototype is unsafe on ROCm. Set "
+                    "default does not run a second target forward. Set "
+                    "UNIFYINFER_DFLASH_TRUE_PARTIAL_VERIFY_SHADOW_FORWARD=1 for "
+                    "the restored shadow-slot path, or "
                     "UNIFYINFER_DFLASH_TRUE_PARTIAL_VERIFY_ALLOW_INPLACE_FORWARD=1 "
                     "only for explicit crash-repro experiments."
                 )
@@ -1426,6 +1445,13 @@ class DFlashWorker:
         if getattr(batch, "has_grammar", False):
             return False
         return True
+
+    def _true_partial_shadow_forward_enabled(self) -> bool:
+        return get_bool_env_var(
+            "UNIFYINFER_DFLASH_TRUE_PARTIAL_VERIFY_SHADOW_FORWARD"
+        ) and get_bool_env_var(
+            "UNIFYINFER_DFLASH_TRUE_PARTIAL_VERIFY_ALLOW_RESTORED_SHADOW_FORWARD"
+        )
 
     def _build_true_partial_verify_mask(
         self,
@@ -1492,7 +1518,6 @@ class DFlashWorker:
                 return
 
             positions = verify_input.positions.view(bs, full_width)
-            out_cache_loc = model_worker_batch.out_cache_loc.view(bs, full_width)
             partial_spec = DFlashVerifyInput(
                 draft_token=candidates[:, :partial_width].reshape(-1).contiguous(),
                 positions=positions[:, :partial_width].reshape(-1).contiguous(),
@@ -1509,20 +1534,38 @@ class DFlashWorker:
                     partial_width=partial_width,
                 )
 
-            partial_worker_batch = replace(
-                model_worker_batch,
-                input_ids=partial_spec.draft_token,
-                out_cache_loc=out_cache_loc[:, :partial_width]
-                .reshape(-1)
-                .contiguous(),
-                spec_info=partial_spec,
-                capture_hidden_mode=CaptureHiddenMode.FULL,
-            )
-            partial_result = self.target_worker.forward_batch_generation(
-                partial_worker_batch,
-                is_verify=True,
-                **forward_kwargs,
-            )
+            if self._true_partial_shadow_forward_enabled():
+                partial_result, shadow_plan = (
+                    self._run_true_partial_verify_shadow_forward(
+                        batch=batch,
+                        model_worker_batch=model_worker_batch,
+                        partial_spec=partial_spec,
+                        partial_width=partial_width,
+                        forward_kwargs=forward_kwargs,
+                    )
+                )
+                if partial_result is None:
+                    return
+            else:
+                out_cache_loc = model_worker_batch.out_cache_loc.view(bs, full_width)
+                shadow_plan = {
+                    "mode": "unsafe_inplace_reused_full_verify_slots",
+                    "eligible": True,
+                }
+                partial_worker_batch = replace(
+                    model_worker_batch,
+                    input_ids=partial_spec.draft_token,
+                    out_cache_loc=out_cache_loc[:, :partial_width]
+                    .reshape(-1)
+                    .contiguous(),
+                    spec_info=partial_spec,
+                    capture_hidden_mode=CaptureHiddenMode.FULL,
+                )
+                partial_result = self.target_worker.forward_batch_generation(
+                    partial_worker_batch,
+                    is_verify=True,
+                    **forward_kwargs,
+                )
             partial_logits = partial_result.logits_output
             partial_hidden = partial_logits.hidden_states
             if partial_hidden is None:
@@ -1550,10 +1593,127 @@ class DFlashWorker:
                 source={
                     "hook": "DFlashWorker._maybe_capture_true_partial_verify_forward",
                     "trace_env": "UNIFYINFER_DFLASH_TRUE_PARTIAL_VERIFY_CAPTURE_JSONL",
+                    "shadow_forward_plan": shadow_plan,
                 },
             )
         except Exception as e:
             logger.warning("DFLASH true partial verify capture failed: %s", e)
+
+    def _run_true_partial_verify_shadow_forward(
+        self,
+        *,
+        batch: ScheduleBatch,
+        model_worker_batch: ModelWorkerBatch,
+        partial_spec: DFlashVerifyInput,
+        partial_width: int,
+        forward_kwargs: dict,
+    ):
+        """Run the proof forward with independent KV slots, then restore state."""
+
+        from unifyinfer.traces.dflash_true_partial_shadow import (
+            build_dflash_true_partial_shadow_forward_plan,
+        )
+
+        bs = batch.batch_size()
+        prefix_lens_cpu = [int(item) for item in batch.seq_lens_cpu.tolist()]
+        shadow_plan = build_dflash_true_partial_shadow_forward_plan(
+            prefix_lens=prefix_lens_cpu,
+            full_width=int(getattr(model_worker_batch.spec_info, "draft_token_num", 0)),
+            partial_width=int(partial_width),
+            page_size=int(self.page_size),
+            allocator_class=batch.token_to_kv_pool_allocator.__class__.__module__
+            + "."
+            + batch.token_to_kv_pool_allocator.__class__.__name__,
+        )
+        if not shadow_plan["eligible"]:
+            logger.warning(
+                "DFLASH true partial shadow forward rejected: %s",
+                shadow_plan.get("rejection_reason"),
+            )
+            return None, shadow_plan
+
+        allocator = batch.token_to_kv_pool_allocator
+        req_to_token = batch.req_to_token_pool.req_to_token
+        allocator_state = allocator.backup_state()
+        saved_req_to_token: list[tuple[int, int, torch.Tensor]] = []
+        try:
+            if self.page_size == 1:
+                shadow_cache_loc = allocator.alloc(bs * int(partial_width))
+            else:
+                end_offset = batch.seq_lens + int(partial_width)
+                end_offset_cpu = batch.seq_lens_cpu + int(partial_width)
+                last_loc = get_last_loc(
+                    req_to_token,
+                    batch.req_pool_indices,
+                    batch.seq_lens,
+                )
+                shadow_cache_loc = allocator.alloc_extend(
+                    batch.seq_lens,
+                    batch.seq_lens_cpu,
+                    end_offset,
+                    end_offset_cpu,
+                    last_loc,
+                    bs * int(partial_width),
+                )
+            if shadow_cache_loc is None:
+                shadow_plan = {
+                    **shadow_plan,
+                    "eligible": False,
+                    "rejection_reason": "shadow_kv_slot_allocation_failed",
+                }
+                logger.warning("DFLASH true partial shadow forward rejected: OOM")
+                return None, shadow_plan
+
+            for req_pool_index, prefix_len in zip(
+                batch.req_pool_indices.detach().cpu().tolist(),
+                prefix_lens_cpu,
+                strict=True,
+            ):
+                end = int(prefix_len) + int(partial_width)
+                req_index = int(req_pool_index)
+                saved_req_to_token.append(
+                    (req_index, end, req_to_token[req_index, :end].detach().clone())
+                )
+
+            end_offset = batch.seq_lens + int(partial_width)
+            assign_req_to_token_pool_func(
+                batch.req_pool_indices,
+                req_to_token,
+                batch.seq_lens,
+                end_offset,
+                shadow_cache_loc,
+                bs,
+            )
+            partial_worker_batch = replace(
+                model_worker_batch,
+                input_ids=partial_spec.draft_token,
+                out_cache_loc=shadow_cache_loc,
+                spec_info=partial_spec,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+            )
+            partial_result = self.target_worker.forward_batch_generation(
+                partial_worker_batch,
+                is_verify=True,
+                **forward_kwargs,
+            )
+            if is_cuda_alike():
+                torch.cuda.synchronize()
+            return partial_result, {
+                **shadow_plan,
+                "allocated_shadow_slots": int(shadow_cache_loc.numel()),
+            }
+        finally:
+            if is_cuda_alike():
+                try:
+                    torch.cuda.synchronize()
+                except Exception as e:
+                    logger.warning(
+                        "DFLASH true partial shadow synchronize before restore failed: %s",
+                        e,
+                    )
+            for req_index, end, saved in saved_req_to_token:
+                req_to_token[req_index, :end] = saved
+            allocator.restore_state(allocator_state)
 
     def forward_batch_generation(
         self,
