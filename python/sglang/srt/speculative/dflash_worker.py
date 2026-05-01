@@ -1401,13 +1401,18 @@ class DFlashWorker:
         shadow_forward = get_bool_env_var(
             "UNIFYINFER_DFLASH_TRUE_PARTIAL_VERIFY_SHADOW_FORWARD"
         )
+        proof_request_forward = get_bool_env_var(
+            "UNIFYINFER_DFLASH_TRUE_PARTIAL_VERIFY_PROOF_REQUEST_FORWARD"
+        )
         allow_restored_shadow = get_bool_env_var(
             "UNIFYINFER_DFLASH_TRUE_PARTIAL_VERIFY_ALLOW_RESTORED_SHADOW_FORWARD"
         )
         allow_unsafe = get_bool_env_var(
             "UNIFYINFER_DFLASH_TRUE_PARTIAL_VERIFY_ALLOW_INPLACE_FORWARD"
         )
-        if shadow_forward and not allow_restored_shadow:
+        if proof_request_forward:
+            pass
+        elif shadow_forward and not allow_restored_shadow:
             if not self._warned_true_partial_verify_unsafe_guard:
                 logger.warning(
                     "DFLASH true partial verify restored-shadow capture requested, "
@@ -1418,11 +1423,13 @@ class DFlashWorker:
                 )
                 self._warned_true_partial_verify_unsafe_guard = True
             return False
-        if not shadow_forward and not allow_unsafe:
+        elif not shadow_forward and not allow_unsafe:
             if not self._warned_true_partial_verify_unsafe_guard:
                 logger.warning(
                     "DFLASH true partial verify capture requested, but the current "
                     "default does not run a second target forward. Set "
+                    "UNIFYINFER_DFLASH_TRUE_PARTIAL_VERIFY_PROOF_REQUEST_FORWARD=1 "
+                    "for the scratch-prefix proof-request path, "
                     "UNIFYINFER_DFLASH_TRUE_PARTIAL_VERIFY_SHADOW_FORWARD=1 for "
                     "the restored shadow-slot path, or "
                     "UNIFYINFER_DFLASH_TRUE_PARTIAL_VERIFY_ALLOW_INPLACE_FORWARD=1 "
@@ -1445,6 +1452,11 @@ class DFlashWorker:
         if getattr(batch, "has_grammar", False):
             return False
         return True
+
+    def _true_partial_proof_request_forward_enabled(self) -> bool:
+        return get_bool_env_var(
+            "UNIFYINFER_DFLASH_TRUE_PARTIAL_VERIFY_PROOF_REQUEST_FORWARD"
+        )
 
     def _true_partial_shadow_forward_enabled(self) -> bool:
         return get_bool_env_var(
@@ -1534,7 +1546,19 @@ class DFlashWorker:
                     partial_width=partial_width,
                 )
 
-            if self._true_partial_shadow_forward_enabled():
+            if self._true_partial_proof_request_forward_enabled():
+                partial_result, shadow_plan = (
+                    self._run_true_partial_verify_proof_request_forward(
+                        batch=batch,
+                        model_worker_batch=model_worker_batch,
+                        partial_spec=partial_spec,
+                        partial_width=partial_width,
+                        forward_kwargs=forward_kwargs,
+                    )
+                )
+                if partial_result is None:
+                    return
+            elif self._true_partial_shadow_forward_enabled():
                 partial_result, shadow_plan = (
                     self._run_true_partial_verify_shadow_forward(
                         batch=batch,
@@ -1598,6 +1622,196 @@ class DFlashWorker:
             )
         except Exception as e:
             logger.warning("DFLASH true partial verify capture failed: %s", e)
+
+    def _alloc_true_partial_proof_tail_slots(
+        self,
+        *,
+        allocator,
+        bs: int,
+        partial_width: int,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, int]:
+        allocation_width = int(partial_width)
+        if self.page_size > 1:
+            allocation_width = (
+                (allocation_width + int(self.page_size) - 1) // int(self.page_size)
+            ) * int(self.page_size)
+        allocated = allocator.alloc(int(bs) * allocation_width)
+        if allocated is None:
+            return None, None, allocation_width
+        if allocation_width == int(partial_width):
+            return allocated, allocated, allocation_width
+        visible = (
+            allocated.view(int(bs), allocation_width)[:, : int(partial_width)]
+            .reshape(-1)
+            .contiguous()
+        )
+        return visible, allocated, allocation_width
+
+    def _run_true_partial_verify_proof_request_forward(
+        self,
+        *,
+        batch: ScheduleBatch,
+        model_worker_batch: ModelWorkerBatch,
+        partial_spec: DFlashVerifyInput,
+        partial_width: int,
+        forward_kwargs: dict,
+    ):
+        """Run the proof forward under a temporary scratch req-pool identity."""
+
+        from unifyinfer.traces.dflash_true_partial_shadow import (
+            build_dflash_true_partial_proof_request_forward_plan,
+        )
+
+        bs = batch.batch_size()
+        req_to_token_pool = batch.req_to_token_pool
+        req_to_token = req_to_token_pool.req_to_token
+        prefix_lens_cpu = [int(item) for item in batch.seq_lens_cpu.tolist()]
+        free_slots = list(req_to_token_pool.free_slots)
+        proof_req_pool_indices_cpu = [int(item) for item in free_slots[:bs]]
+        has_mamba_mapping = hasattr(
+            req_to_token_pool, "req_index_to_mamba_index_mapping"
+        )
+        proof_plan = build_dflash_true_partial_proof_request_forward_plan(
+            prefix_lens=prefix_lens_cpu,
+            full_width=int(getattr(model_worker_batch.spec_info, "draft_token_num", 0)),
+            partial_width=int(partial_width),
+            page_size=int(self.page_size),
+            req_pool_available=len(free_slots),
+            req_to_token_table_width=int(req_to_token.shape[1]),
+            allocator_class=batch.token_to_kv_pool_allocator.__class__.__module__
+            + "."
+            + batch.token_to_kv_pool_allocator.__class__.__name__,
+            req_to_token_pool_class=req_to_token_pool.__class__.__module__
+            + "."
+            + req_to_token_pool.__class__.__name__,
+            has_mamba_mapping=has_mamba_mapping,
+        )
+        if not proof_plan["eligible"]:
+            logger.warning(
+                "DFLASH true partial proof-request forward rejected: %s",
+                proof_plan.get("rejection_reason"),
+            )
+            return None, proof_plan
+
+        allocator = batch.token_to_kv_pool_allocator
+        allocator_state = allocator.backup_state()
+        saved_free_slots = list(req_to_token_pool.free_slots)
+        saved_req_rows: list[tuple[int, int, torch.Tensor]] = []
+        saved_mamba_rows: list[tuple[torch.Tensor, int, torch.Tensor]] = []
+        proof_req_pool_indices = torch.tensor(
+            proof_req_pool_indices_cpu,
+            dtype=batch.req_pool_indices.dtype,
+            device=batch.req_pool_indices.device,
+        )
+        try:
+            req_to_token_pool.free_slots = req_to_token_pool.free_slots[bs:]
+            proof_cache_loc, allocated_cache_loc, allocation_width = (
+                self._alloc_true_partial_proof_tail_slots(
+                    allocator=allocator,
+                    bs=bs,
+                    partial_width=partial_width,
+                )
+            )
+            if proof_cache_loc is None or allocated_cache_loc is None:
+                proof_plan = {
+                    **proof_plan,
+                    "eligible": False,
+                    "rejection_reason": "proof_tail_kv_slot_allocation_failed",
+                }
+                logger.warning("DFLASH true partial proof-request forward rejected: OOM")
+                return None, proof_plan
+
+            source_req_pool_indices = [
+                int(item) for item in batch.req_pool_indices.detach().cpu().tolist()
+            ]
+            proof_cache_loc_2d = proof_cache_loc.view(bs, int(partial_width))
+            max_restore_end = max(
+                int(prefix_len) + int(partial_width)
+                for prefix_len in prefix_lens_cpu
+            )
+            for proof_req_pool_index in proof_req_pool_indices_cpu:
+                saved_req_rows.append(
+                    (
+                        int(proof_req_pool_index),
+                        max_restore_end,
+                        req_to_token[
+                            int(proof_req_pool_index), :max_restore_end
+                        ].detach().clone(),
+                    )
+                )
+
+            for row_index, (source_req_pool_index, proof_req_pool_index, prefix_len) in enumerate(
+                zip(
+                    source_req_pool_indices,
+                    proof_req_pool_indices_cpu,
+                    prefix_lens_cpu,
+                    strict=True,
+                )
+            ):
+                source_req_pool_index_i = int(source_req_pool_index)
+                proof_req_pool_index_i = int(proof_req_pool_index)
+                prefix_len_i = int(prefix_len)
+                end = prefix_len_i + int(partial_width)
+                req_to_token[proof_req_pool_index_i, :prefix_len_i] = req_to_token[
+                    source_req_pool_index_i, :prefix_len_i
+                ]
+                req_to_token[proof_req_pool_index_i, prefix_len_i:end] = (
+                    proof_cache_loc_2d[row_index].to(req_to_token.dtype)
+                )
+
+                for attr in (
+                    "req_index_to_mamba_index_mapping",
+                    "req_index_to_mamba_ping_pong_track_buffer_mapping",
+                ):
+                    mapping = getattr(req_to_token_pool, attr, None)
+                    if mapping is None:
+                        continue
+                    saved_mamba_rows.append(
+                        (
+                            mapping,
+                            proof_req_pool_index_i,
+                            mapping[proof_req_pool_index_i].detach().clone(),
+                        )
+                    )
+                    mapping[proof_req_pool_index_i] = mapping[source_req_pool_index_i]
+
+            partial_worker_batch = replace(
+                model_worker_batch,
+                input_ids=partial_spec.draft_token,
+                req_pool_indices=proof_req_pool_indices,
+                out_cache_loc=proof_cache_loc,
+                spec_info=partial_spec,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+            )
+            partial_result = self.target_worker.forward_batch_generation(
+                partial_worker_batch,
+                is_verify=True,
+                **forward_kwargs,
+            )
+            if is_cuda_alike():
+                torch.cuda.synchronize()
+            return partial_result, {
+                **proof_plan,
+                "proof_req_pool_indices": proof_req_pool_indices_cpu,
+                "allocated_tail_slots": int(proof_cache_loc.numel()),
+                "allocated_tail_allocation_slots": int(allocated_cache_loc.numel()),
+                "tail_allocation_width_per_request": int(allocation_width),
+            }
+        finally:
+            if is_cuda_alike():
+                try:
+                    torch.cuda.synchronize()
+                except Exception as e:
+                    logger.warning(
+                        "DFLASH true partial proof-request synchronize before restore failed: %s",
+                        e,
+                    )
+            for mapping, proof_req_pool_index, saved in reversed(saved_mamba_rows):
+                mapping[proof_req_pool_index] = saved
+            for proof_req_pool_index, end, saved in saved_req_rows:
+                req_to_token[proof_req_pool_index, :end] = saved
+            req_to_token_pool.free_slots = saved_free_slots
+            allocator.restore_state(allocator_state)
 
     def _run_true_partial_verify_shadow_forward(
         self,
