@@ -14,6 +14,8 @@
 # ==============================================================================
 """Inference-only Qwen3.5 model and Qwen3.5 MoE model compatible with HuggingFace weights."""
 
+import hashlib
+import json
 import logging
 import os
 import time
@@ -222,6 +224,9 @@ _use_unifyinfer_qwen35_trace_attn_split = get_bool_env_var(
     "UNIFYINFER_QWEN35_TRACE_ATTN_SPLIT"
 )
 _use_unifyinfer_qwen35_dflash_profile = get_bool_env_var("SGLANG_DFLASH_PROFILE")
+_use_unifyinfer_qwen35_dflash_boundary_digests = get_bool_env_var(
+    "UNIFYINFER_QWEN35_DFLASH_BOUNDARY_DIGESTS"
+)
 _is_amx_available = cpu_has_amx_support()
 
 
@@ -334,6 +339,111 @@ def _qwen35_dflash_profile_add(profile, key: str, value: float) -> None:
 def _qwen35_dflash_profile_inc(profile, key: str) -> None:
     if profile is not None:
         profile[key] = int(profile.get(key, 0)) + 1
+
+
+def _qwen35_dflash_boundary_digest_enabled(
+    forward_batch: Optional[ForwardBatch],
+) -> bool:
+    return (
+        _use_unifyinfer_qwen35_dflash_boundary_digests
+        and forward_batch is not None
+        and forward_batch.forward_mode.is_target_verify()
+    )
+
+
+def _qwen35_dflash_boundary_probe_layers(layers_to_capture: list[int]) -> Set[int]:
+    configured = _parse_layer_id_set(
+        os.environ.get("UNIFYINFER_QWEN35_DFLASH_BOUNDARY_DIGEST_LAYERS")
+    )
+    if configured:
+        return configured
+    if layers_to_capture:
+        first_capture = min(int(layer_id) for layer_id in layers_to_capture)
+        return set(range(max(0, first_capture - 2), first_capture + 1))
+    return {0, 1, 2}
+
+
+def _qwen35_dflash_boundary_max_rows() -> int:
+    raw = os.environ.get("UNIFYINFER_QWEN35_DFLASH_BOUNDARY_DIGEST_MAX_ROWS", "32")
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 32
+
+
+def _qwen35_dflash_digest_tensor(tensor: torch.Tensor) -> str:
+    cpu = tensor.detach().contiguous().to(device="cpu")
+    original_dtype = str(cpu.dtype)
+    raw_tensor = cpu.view(torch.uint16) if cpu.dtype == torch.bfloat16 else cpu
+    try:
+        raw_bytes = raw_tensor.numpy().tobytes()
+        digest_dtype = original_dtype
+    except Exception:
+        raw_tensor = cpu.to(torch.float32)
+        raw_bytes = raw_tensor.numpy().tobytes()
+        digest_dtype = "torch.float32_from_" + original_dtype
+    hasher = hashlib.sha256()
+    hasher.update(original_dtype.encode("utf-8"))
+    hasher.update(b"\0")
+    hasher.update(json.dumps(list(cpu.shape), separators=(",", ":")).encode("utf-8"))
+    hasher.update(b"\0")
+    hasher.update(digest_dtype.encode("utf-8"))
+    hasher.update(b"\0")
+    hasher.update(raw_bytes)
+    return "sha256:" + hasher.hexdigest()
+
+
+def _qwen35_dflash_record_boundary_digest(
+    forward_batch: Optional[ForwardBatch],
+    *,
+    layer_id: int,
+    stage: str,
+    tensor: Optional[torch.Tensor],
+) -> None:
+    if (
+        not _qwen35_dflash_boundary_digest_enabled(forward_batch)
+        or tensor is None
+        or not isinstance(tensor, torch.Tensor)
+    ):
+        return
+    if tensor.ndim == 0:
+        return
+
+    max_rows = _qwen35_dflash_boundary_max_rows()
+    if max_rows <= 0:
+        return
+    view = tensor.detach().reshape(int(tensor.shape[0]), -1)
+    rows = min(int(view.shape[0]), max_rows)
+    records = getattr(
+        forward_batch, "_unifyinfer_qwen35_dflash_boundary_digests", None
+    )
+    if records is None:
+        records = []
+        setattr(forward_batch, "_unifyinfer_qwen35_dflash_boundary_digests", records)
+    records.append(
+        {
+            "layer_id": int(layer_id),
+            "stage": str(stage),
+            "shape": [int(dim) for dim in tensor.shape],
+            "dtype": str(tensor.dtype),
+            "rows_recorded": rows,
+            "row_digests": [
+                _qwen35_dflash_digest_tensor(view[row_index])
+                for row_index in range(rows)
+            ],
+        }
+    )
+
+
+def _qwen35_dflash_current_boundary_probe_layer(
+    forward_batch: Optional[ForwardBatch], layer_id: int
+) -> bool:
+    probe_layers = getattr(
+        forward_batch,
+        "_unifyinfer_qwen35_dflash_boundary_probe_layers",
+        None,
+    )
+    return isinstance(probe_layers, set) and int(layer_id) in probe_layers
 
 
 def _should_use_unifyinfer_qwen35_fused_rmsnorm_gated(
@@ -707,10 +817,32 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         dflash_profile = _qwen35_dflash_layer_profile(forward_batch)
         dflash_profile_enabled = dflash_profile is not None
         dflash_profile_phase = _qwen35_dflash_profile_start(dflash_profile_enabled)
+        dflash_boundary_probe_layer = _qwen35_dflash_current_boundary_probe_layer(
+            forward_batch,
+            int(self.layer_id),
+        )
+
+        def record_dflash_boundary(stage: str, tensor: Optional[torch.Tensor]) -> None:
+            if dflash_boundary_probe_layer:
+                _qwen35_dflash_record_boundary_digest(
+                    forward_batch,
+                    layer_id=int(self.layer_id),
+                    stage=stage,
+                    tensor=tensor,
+                )
+
         with _qwen35_trace_span("_qwen35_gdnsplit_inproj"):
             projected_states_qkvz, projected_states_ba = self._forward_input_proj(
                 hidden_states,
                 forward_batch,
+            )
+            record_dflash_boundary(
+                "linear_attn_projected_qkvz",
+                projected_states_qkvz,
+            )
+            record_dflash_boundary(
+                "linear_attn_projected_ba",
+                projected_states_ba,
             )
         _qwen35_dflash_profile_add(
             dflash_profile,
@@ -756,6 +888,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     lambda x: x.reshape(x.shape[0], -1), (query, key, value)
                 )
                 mixed_qkv = torch.cat((query, key, value), dim=-1)
+            record_dflash_boundary("linear_attn_mixed_qkv", mixed_qkv)
+            record_dflash_boundary("linear_attn_z", z)
+            record_dflash_boundary("linear_attn_b", b)
+            record_dflash_boundary("linear_attn_a", a)
         _qwen35_dflash_profile_add(
             dflash_profile,
             "gdn_repack_ms",
@@ -772,6 +908,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 a=a,
                 b=b,
             )
+            core_attn_out_boundary = core_attn_out
+            if (
+                core_attn_out_boundary.ndim >= 4
+                and core_attn_out_boundary.shape[0] == 1
+            ):
+                core_attn_out_boundary = core_attn_out_boundary.squeeze(0)
+            record_dflash_boundary("linear_attn_core_output", core_attn_out_boundary)
         _qwen35_dflash_profile_add(
             dflash_profile,
             "gdn_core_ms",
@@ -806,6 +949,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 core_attn_out = self.norm(core_attn_out, z)
             core_attn_out = core_attn_out.reshape(z_shape_og)
             core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
+            record_dflash_boundary("linear_attn_norm_output", core_attn_out)
         _qwen35_dflash_profile_add(
             dflash_profile,
             "gdn_postnorm_ms",
@@ -817,6 +961,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         dflash_profile_phase = _qwen35_dflash_profile_start(dflash_profile_enabled)
         with _qwen35_trace_span("_qwen35_gdnsplit_outproj"):
             output, _ = self.out_proj(core_attn_out)
+            record_dflash_boundary("linear_attn_out_proj_output", output)
         _qwen35_dflash_profile_add(
             dflash_profile,
             "gdn_outproj_ms",
@@ -911,6 +1056,24 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         dflash_profile = _qwen35_dflash_layer_profile(forward_batch)
         dflash_profile_enabled = dflash_profile is not None
         dflash_profile_total = _qwen35_dflash_profile_start(dflash_profile_enabled)
+        dflash_boundary_probe_layers = kwargs.get("dflash_boundary_probe_layers")
+        dflash_boundary_probe_layer = (
+            isinstance(dflash_boundary_probe_layers, set)
+            and int(self.layer_id) in dflash_boundary_probe_layers
+        )
+        if dflash_boundary_probe_layer:
+            _qwen35_dflash_record_boundary_digest(
+                forward_batch,
+                layer_id=int(self.layer_id),
+                stage="layer_input_hidden",
+                tensor=hidden_states,
+            )
+            _qwen35_dflash_record_boundary_digest(
+                forward_batch,
+                layer_id=int(self.layer_id),
+                stage="layer_input_residual",
+                tensor=residual,
+            )
 
         dflash_profile_phase = _qwen35_dflash_profile_start(dflash_profile_enabled)
         hidden_states, residual = (
@@ -930,6 +1093,19 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 dflash_profile_enabled, dflash_profile_phase
             ),
         )
+        if dflash_boundary_probe_layer:
+            _qwen35_dflash_record_boundary_digest(
+                forward_batch,
+                layer_id=int(self.layer_id),
+                stage="post_input_layernorm_hidden",
+                tensor=hidden_states,
+            )
+            _qwen35_dflash_record_boundary_digest(
+                forward_batch,
+                layer_id=int(self.layer_id),
+                stage="post_input_layernorm_residual",
+                tensor=residual,
+            )
 
         if not forward_batch.forward_mode.is_idle():
             dflash_profile_phase = _qwen35_dflash_profile_start(
@@ -946,6 +1122,13 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                     dflash_profile_enabled, dflash_profile_phase
                 ),
             )
+            if dflash_boundary_probe_layer:
+                _qwen35_dflash_record_boundary_digest(
+                    forward_batch,
+                    layer_id=int(self.layer_id),
+                    stage="post_linear_attn_hidden",
+                    tensor=hidden_states,
+                )
 
         # Fully Connected
         dflash_profile_phase = _qwen35_dflash_profile_start(dflash_profile_enabled)
@@ -959,6 +1142,19 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 dflash_profile_enabled, dflash_profile_phase
             ),
         )
+        if dflash_boundary_probe_layer:
+            _qwen35_dflash_record_boundary_digest(
+                forward_batch,
+                layer_id=int(self.layer_id),
+                stage="post_attention_layernorm_hidden",
+                tensor=hidden_states,
+            )
+            _qwen35_dflash_record_boundary_digest(
+                forward_batch,
+                layer_id=int(self.layer_id),
+                stage="post_attention_layernorm_residual",
+                tensor=residual,
+            )
 
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
@@ -988,8 +1184,22 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 dflash_profile_enabled, dflash_profile_phase
             ),
         )
+        if dflash_boundary_probe_layer:
+            _qwen35_dflash_record_boundary_digest(
+                forward_batch,
+                layer_id=int(self.layer_id),
+                stage="post_mlp_hidden",
+                tensor=hidden_states,
+            )
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
+            if dflash_boundary_probe_layer:
+                _qwen35_dflash_record_boundary_digest(
+                    forward_batch,
+                    layer_id=int(self.layer_id),
+                    stage="layer_output_pending_allreduce_hidden",
+                    tensor=hidden_states,
+                )
         else:
             dflash_profile_phase = _qwen35_dflash_profile_start(
                 dflash_profile_enabled
@@ -1004,6 +1214,19 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                     dflash_profile_enabled, dflash_profile_phase
                 ),
             )
+            if dflash_boundary_probe_layer:
+                _qwen35_dflash_record_boundary_digest(
+                    forward_batch,
+                    layer_id=int(self.layer_id),
+                    stage="layer_output_hidden",
+                    tensor=hidden_states,
+                )
+                _qwen35_dflash_record_boundary_digest(
+                    forward_batch,
+                    layer_id=int(self.layer_id),
+                    stage="layer_output_residual",
+                    tensor=residual,
+                )
 
         if dflash_profile is not None:
             _qwen35_dflash_profile_inc(dflash_profile, "profiled_layers")
@@ -1272,6 +1495,24 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         dflash_profile = _qwen35_dflash_layer_profile(forward_batch)
         dflash_profile_enabled = dflash_profile is not None
         dflash_profile_total = _qwen35_dflash_profile_start(dflash_profile_enabled)
+        dflash_boundary_probe_layers = kwargs.get("dflash_boundary_probe_layers")
+        dflash_boundary_probe_layer = (
+            isinstance(dflash_boundary_probe_layers, set)
+            and int(self.layer_id) in dflash_boundary_probe_layers
+        )
+        if dflash_boundary_probe_layer:
+            _qwen35_dflash_record_boundary_digest(
+                forward_batch,
+                layer_id=int(self.layer_id),
+                stage="layer_input_hidden",
+                tensor=hidden_states,
+            )
+            _qwen35_dflash_record_boundary_digest(
+                forward_batch,
+                layer_id=int(self.layer_id),
+                stage="layer_input_residual",
+                tensor=residual,
+            )
 
         dflash_profile_phase = _qwen35_dflash_profile_start(dflash_profile_enabled)
         hidden_states, residual = (
@@ -1289,6 +1530,19 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 dflash_profile_enabled, dflash_profile_phase
             ),
         )
+        if dflash_boundary_probe_layer:
+            _qwen35_dflash_record_boundary_digest(
+                forward_batch,
+                layer_id=int(self.layer_id),
+                stage="post_input_layernorm_hidden",
+                tensor=hidden_states,
+            )
+            _qwen35_dflash_record_boundary_digest(
+                forward_batch,
+                layer_id=int(self.layer_id),
+                stage="post_input_layernorm_residual",
+                tensor=residual,
+            )
 
         if not forward_batch.forward_mode.is_idle():
             dflash_profile_phase = _qwen35_dflash_profile_start(
@@ -1306,6 +1560,13 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                     dflash_profile_enabled, dflash_profile_phase
                 ),
             )
+            if dflash_boundary_probe_layer:
+                _qwen35_dflash_record_boundary_digest(
+                    forward_batch,
+                    layer_id=int(self.layer_id),
+                    stage="post_self_attn_hidden",
+                    tensor=hidden_states,
+                )
 
         # Fully Connected
         dflash_profile_phase = _qwen35_dflash_profile_start(dflash_profile_enabled)
@@ -1319,6 +1580,19 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 dflash_profile_enabled, dflash_profile_phase
             ),
         )
+        if dflash_boundary_probe_layer:
+            _qwen35_dflash_record_boundary_digest(
+                forward_batch,
+                layer_id=int(self.layer_id),
+                stage="post_attention_layernorm_hidden",
+                tensor=hidden_states,
+            )
+            _qwen35_dflash_record_boundary_digest(
+                forward_batch,
+                layer_id=int(self.layer_id),
+                stage="post_attention_layernorm_residual",
+                tensor=residual,
+            )
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
@@ -1347,8 +1621,22 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 dflash_profile_enabled, dflash_profile_phase
             ),
         )
+        if dflash_boundary_probe_layer:
+            _qwen35_dflash_record_boundary_digest(
+                forward_batch,
+                layer_id=int(self.layer_id),
+                stage="post_mlp_hidden",
+                tensor=hidden_states,
+            )
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
+            if dflash_boundary_probe_layer:
+                _qwen35_dflash_record_boundary_digest(
+                    forward_batch,
+                    layer_id=int(self.layer_id),
+                    stage="layer_output_pending_allreduce_hidden",
+                    tensor=hidden_states,
+                )
         else:
             dflash_profile_phase = _qwen35_dflash_profile_start(
                 dflash_profile_enabled
@@ -1363,6 +1651,19 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                     dflash_profile_enabled, dflash_profile_phase
                 ),
             )
+            if dflash_boundary_probe_layer:
+                _qwen35_dflash_record_boundary_digest(
+                    forward_batch,
+                    layer_id=int(self.layer_id),
+                    stage="layer_output_hidden",
+                    tensor=hidden_states,
+                )
+                _qwen35_dflash_record_boundary_digest(
+                    forward_batch,
+                    layer_id=int(self.layer_id),
+                    stage="layer_output_residual",
+                    tensor=residual,
+                )
 
         if dflash_profile is not None:
             _qwen35_dflash_profile_inc(dflash_profile, "profiled_layers")
@@ -1497,6 +1798,18 @@ class Qwen3_5ForCausalLM(nn.Module):
                 "_qwen35_dflash_layer_profile",
                 _qwen35_dflash_new_layer_profile(),
             )
+        dflash_boundary_probe_layers = (
+            _qwen35_dflash_boundary_probe_layers(self.layers_to_capture)
+            if _qwen35_dflash_boundary_digest_enabled(forward_batch)
+            else set()
+        )
+        if dflash_boundary_probe_layers:
+            setattr(forward_batch, "_unifyinfer_qwen35_dflash_boundary_digests", [])
+            setattr(
+                forward_batch,
+                "_unifyinfer_qwen35_dflash_boundary_probe_layers",
+                dflash_boundary_probe_layers,
+            )
 
         # Initialize hidden states
         dflash_profile_phase = _qwen35_dflash_profile_start(dflash_profile_enabled)
@@ -1513,6 +1826,13 @@ class Qwen3_5ForCausalLM(nn.Module):
         dflash_embed_ms = _qwen35_dflash_profile_elapsed_ms(
             dflash_profile_enabled, dflash_profile_phase
         )
+        if dflash_boundary_probe_layers:
+            _qwen35_dflash_record_boundary_digest(
+                forward_batch,
+                layer_id=-1,
+                stage="embedding_output",
+                tensor=hidden_states,
+            )
 
         aux_hidden_states = []
         dflash_profile_phase = _qwen35_dflash_profile_start(dflash_profile_enabled)
@@ -1527,6 +1847,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                     hidden_states=hidden_states,
                     residual=residual,
                     forward_batch=forward_batch,
+                    dflash_boundary_probe_layers=dflash_boundary_probe_layers,
                     captured_last_layer_outputs=(
                         aux_hidden_states
                         if getattr(layer, "_is_layer_to_capture", False)

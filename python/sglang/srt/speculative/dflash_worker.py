@@ -1807,6 +1807,16 @@ class DFlashWorker:
             partial_target_predict = torch.argmax(
                 partial_logits.next_token_logits, dim=-1
             ).view(bs, partial_width)
+            full_boundary_digests = getattr(
+                logits_output,
+                "unifyinfer_qwen35_dflash_boundary_digests",
+                None,
+            )
+            partial_boundary_digests = getattr(
+                partial_logits,
+                "unifyinfer_qwen35_dflash_boundary_digests",
+                None,
+            )
 
             from unifyinfer.traces.dflash_partial_verify_capture import (
                 maybe_append_dflash_true_partial_verify_capture,
@@ -1841,6 +1851,15 @@ class DFlashWorker:
                     ],
                     "out_cache_loc_shape": list(model_worker_batch.out_cache_loc.shape),
                     **self._target_aux_hidden_capture_source(),
+                    "boundary_digest_probe": {
+                        "enabled": bool(
+                            full_boundary_digests is not None
+                            or partial_boundary_digests is not None
+                        ),
+                        "env": "UNIFYINFER_QWEN35_DFLASH_BOUNDARY_DIGESTS",
+                        "full": full_boundary_digests or [],
+                        "partial": partial_boundary_digests or [],
+                    },
                     "shadow_forward_plan": shadow_plan,
                 },
             )

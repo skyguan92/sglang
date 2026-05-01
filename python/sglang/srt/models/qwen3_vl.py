@@ -1400,6 +1400,17 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                     forward_batch,
                     aux_hidden_states,
                 )
+                boundary_digests = getattr(
+                    forward_batch,
+                    "_unifyinfer_qwen35_dflash_boundary_digests",
+                    None,
+                )
+                if boundary_digests is not None:
+                    setattr(
+                        logits_output,
+                        "unifyinfer_qwen35_dflash_boundary_digests",
+                        boundary_digests,
+                    )
                 dflash_logits_processor_ms = _qwen35_dflash_profile_elapsed_ms(
                     dflash_profile_enabled, dflash_profile_phase
                 )
