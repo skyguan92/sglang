@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import math
@@ -5,7 +6,7 @@ import os
 import time
 from copy import deepcopy
 from dataclasses import replace
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 import torch
 
@@ -1465,6 +1466,190 @@ class DFlashWorker:
             "UNIFYINFER_DFLASH_TRUE_PARTIAL_VERIFY_ALLOW_RESTORED_SHADOW_FORWARD"
         )
 
+    def _true_partial_state_digests_enabled(self) -> bool:
+        return get_bool_env_var(
+            "UNIFYINFER_DFLASH_TRUE_PARTIAL_VERIFY_STATE_DIGESTS"
+        )
+
+    def _small_tensor_list(self, tensor: Optional[torch.Tensor], *, limit: int = 32):
+        if tensor is None:
+            return None
+        try:
+            flat = tensor.detach().reshape(-1)[:limit].to(device="cpu")
+            return [int(item) for item in flat.tolist()]
+        except Exception as e:
+            return {"error": str(e)}
+
+    def _digest_tensor(self, tensor: torch.Tensor) -> dict[str, Any]:
+        cpu = tensor.detach().contiguous().to(device="cpu")
+        original_dtype = str(cpu.dtype)
+        raw_tensor = cpu.view(torch.uint16) if cpu.dtype == torch.bfloat16 else cpu
+        try:
+            raw_bytes = raw_tensor.numpy().tobytes()
+            digest_dtype = original_dtype
+        except Exception:
+            raw_tensor = cpu.to(torch.float32)
+            raw_bytes = raw_tensor.numpy().tobytes()
+            digest_dtype = "torch.float32_from_" + original_dtype
+        hasher = hashlib.sha256()
+        hasher.update(original_dtype.encode("utf-8"))
+        hasher.update(b"\0")
+        hasher.update(json.dumps(list(cpu.shape), separators=(",", ":")).encode("utf-8"))
+        hasher.update(b"\0")
+        hasher.update(raw_bytes)
+        return {
+            "shape": list(cpu.shape),
+            "dtype": original_dtype,
+            "digest_dtype": digest_dtype,
+            "digest": "sha256:" + hasher.hexdigest(),
+        }
+
+    def _digest_tensor_axis_indices(
+        self,
+        *,
+        tensor: torch.Tensor,
+        axis: int,
+        indices: list[int],
+    ) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        axis_i = int(axis)
+        dim = int(tensor.shape[axis_i])
+        for index in self._unique_ints(indices):
+            if index < 0 or index >= dim:
+                out.append({"index": int(index), "present": False, "dim": dim})
+                continue
+            selected = tensor.select(axis_i, int(index))
+            out.append({"index": int(index), "present": True, **self._digest_tensor(selected)})
+        return out
+
+    def _unique_ints(self, values: list[int]) -> list[int]:
+        out: list[int] = []
+        seen: set[int] = set()
+        for value in values:
+            value_i = int(value)
+            if value_i in seen:
+                continue
+            seen.add(value_i)
+            out.append(value_i)
+        return out
+
+    def _snapshot_true_partial_forward_metadata(self) -> dict[str, Any]:
+        attn_backend = self.target_worker.model_runner.attn_backend
+        linear_backend = getattr(attn_backend, "linear_attn_backend", attn_backend)
+        metadata = getattr(linear_backend, "forward_metadata", None)
+        if metadata is None:
+            return {"present": False}
+        return {
+            "present": True,
+            "class": metadata.__class__.__module__ + "." + metadata.__class__.__name__,
+            "query_start_loc": self._small_tensor_list(
+                getattr(metadata, "query_start_loc", None)
+            ),
+            "mamba_cache_indices": self._small_tensor_list(
+                getattr(metadata, "mamba_cache_indices", None)
+            ),
+            "retrieve_next_token": self._small_tensor_list(
+                getattr(metadata, "retrieve_next_token", None)
+            ),
+            "retrieve_next_sibling": self._small_tensor_list(
+                getattr(metadata, "retrieve_next_sibling", None)
+            ),
+            "retrieve_parent_token": self._small_tensor_list(
+                getattr(metadata, "retrieve_parent_token", None)
+            ),
+        }
+
+    def _snapshot_true_partial_recurrent_state(
+        self,
+        *,
+        batch: ScheduleBatch,
+        stage: str,
+        source_req_pool_indices: list[int],
+        proof_req_pool_indices: list[int],
+        partial_width: int,
+    ) -> dict[str, Any] | None:
+        if not self._true_partial_state_digests_enabled():
+            return None
+        try:
+            req_to_token_pool = batch.req_to_token_pool
+            req_device = batch.req_pool_indices.device
+            source_req_tensor = torch.tensor(
+                source_req_pool_indices,
+                dtype=batch.req_pool_indices.dtype,
+                device=req_device,
+            )
+            proof_req_tensor = torch.tensor(
+                proof_req_pool_indices,
+                dtype=batch.req_pool_indices.dtype,
+                device=req_device,
+            )
+            source_mamba_indices = (
+                req_to_token_pool.get_mamba_indices(source_req_tensor)
+                if source_req_pool_indices
+                else torch.empty((0,), dtype=torch.int32, device=req_device)
+            )
+            proof_mamba_indices = (
+                req_to_token_pool.get_mamba_indices(proof_req_tensor)
+                if proof_req_pool_indices
+                else torch.empty((0,), dtype=torch.int32, device=req_device)
+            )
+            source_mamba_cpu = [
+                int(item)
+                for item in source_mamba_indices.detach().to(device="cpu").tolist()
+            ]
+            proof_mamba_cpu = [
+                int(item)
+                for item in proof_mamba_indices.detach().to(device="cpu").tolist()
+            ]
+            caches = req_to_token_pool.get_speculative_mamba2_params_all_layers()
+            req_indices = self._unique_ints(source_req_pool_indices + proof_req_pool_indices)
+            mamba_indices = self._unique_ints(source_mamba_cpu + proof_mamba_cpu)
+            snapshot = {
+                "stage": stage,
+                "partial_width": int(partial_width),
+                "source_req_pool_indices": [int(item) for item in source_req_pool_indices],
+                "proof_req_pool_indices": [int(item) for item in proof_req_pool_indices],
+                "source_mamba_indices": source_mamba_cpu,
+                "proof_mamba_indices": proof_mamba_cpu,
+                "forward_metadata": self._snapshot_true_partial_forward_metadata(),
+                "state_digests": {
+                    "temporal_by_mamba_index": self._digest_tensor_axis_indices(
+                        tensor=caches.temporal,
+                        axis=1,
+                        indices=mamba_indices,
+                    ),
+                    "intermediate_ssm_by_req_index": self._digest_tensor_axis_indices(
+                        tensor=caches.intermediate_ssm,
+                        axis=1,
+                        indices=req_indices,
+                    ),
+                },
+            }
+            conv_cache = getattr(caches, "conv", None)
+            if conv_cache is not None and len(conv_cache) > 0:
+                snapshot["state_digests"]["conv0_by_mamba_index"] = (
+                    self._digest_tensor_axis_indices(
+                        tensor=conv_cache[0],
+                        axis=1,
+                        indices=mamba_indices,
+                    )
+                )
+            intermediate_conv_cache = getattr(caches, "intermediate_conv_window", None)
+            if intermediate_conv_cache is not None and len(intermediate_conv_cache) > 0:
+                snapshot["state_digests"]["intermediate_conv0_by_req_index"] = (
+                    self._digest_tensor_axis_indices(
+                        tensor=intermediate_conv_cache[0],
+                        axis=1,
+                        indices=req_indices,
+                    )
+                )
+            return snapshot
+        except Exception as e:
+            return {
+                "stage": stage,
+                "error": str(e),
+            }
+
     def _build_true_partial_verify_mask(
         self,
         *,
@@ -1719,7 +1904,30 @@ class DFlashWorker:
             dtype=batch.req_pool_indices.dtype,
             device=batch.req_pool_indices.device,
         )
+        source_req_pool_indices = [
+            int(item) for item in batch.req_pool_indices.detach().cpu().tolist()
+        ]
+        recurrent_state_probe: dict[str, Any] | None = (
+            {"schema_version": 1, "artifact": "dflash_true_partial_recurrent_state_probe", "snapshots": []}
+            if self._true_partial_state_digests_enabled()
+            else None
+        )
+
+        def _append_recurrent_snapshot(stage: str) -> None:
+            if recurrent_state_probe is None:
+                return
+            snapshot = self._snapshot_true_partial_recurrent_state(
+                batch=batch,
+                stage=stage,
+                source_req_pool_indices=source_req_pool_indices,
+                proof_req_pool_indices=proof_req_pool_indices_cpu,
+                partial_width=partial_width,
+            )
+            if snapshot is not None:
+                recurrent_state_probe["snapshots"].append(snapshot)
+
         try:
+            _append_recurrent_snapshot("before_proof_request_setup")
             req_to_token_pool.free_slots = req_to_token_pool.free_slots[bs:]
             proof_cache_loc, allocated_cache_loc, allocation_width = (
                 self._alloc_true_partial_proof_tail_slots(
@@ -1737,9 +1945,6 @@ class DFlashWorker:
                 logger.warning("DFLASH true partial proof-request forward rejected: OOM")
                 return None, proof_plan
 
-            source_req_pool_indices = [
-                int(item) for item in batch.req_pool_indices.detach().cpu().tolist()
-            ]
             proof_cache_loc_2d = proof_cache_loc.view(bs, int(partial_width))
             max_restore_end = max(
                 int(prefix_len) + int(partial_width)
@@ -1806,6 +2011,7 @@ class DFlashWorker:
                         }
                     )
 
+            _append_recurrent_snapshot("before_partial_forward")
             partial_worker_batch = replace(
                 model_worker_batch,
                 input_ids=partial_spec.draft_token,
@@ -1821,6 +2027,7 @@ class DFlashWorker:
             )
             if is_cuda_alike():
                 torch.cuda.synchronize()
+            _append_recurrent_snapshot("after_partial_forward")
             return partial_result, {
                 **proof_plan,
                 "source_req_pool_indices": source_req_pool_indices,
@@ -1829,6 +2036,11 @@ class DFlashWorker:
                 "allocated_tail_allocation_slots": int(allocated_cache_loc.numel()),
                 "tail_allocation_width_per_request": int(allocation_width),
                 "mamba_mapping_copies": mamba_mapping_copies,
+                **(
+                    {"recurrent_state_probe": recurrent_state_probe}
+                    if recurrent_state_probe is not None
+                    else {}
+                ),
             }
         finally:
             if is_cuda_alike():
@@ -1845,6 +2057,7 @@ class DFlashWorker:
                 req_to_token[proof_req_pool_index, :end] = saved
             req_to_token_pool.free_slots = saved_free_slots
             allocator.restore_state(allocator_state)
+            _append_recurrent_snapshot("after_restore")
 
     def _run_true_partial_verify_shadow_forward(
         self,
