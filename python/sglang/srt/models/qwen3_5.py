@@ -301,6 +301,14 @@ def _qwen35_dflash_new_layer_profile() -> dict[str, float | int]:
         "moe_dual_stream_layers": 0,
         "moe_fused_shared_layers": 0,
         "moe_shared_disabled_layers": 0,
+        "moe_empty_layers": 0,
+        "moe_input_tokens": 0,
+        "moe_hidden_elements": 0,
+        "moe_topk_assignments": 0,
+        "moe_topk_width_sum": 0,
+        "moe_topk_width_layers": 0,
+        "moe_standard_topk_layers": 0,
+        "moe_nonstandard_topk_layers": 0,
         "moe_gate_ms": 0.0,
         "moe_topk_ms": 0.0,
         "moe_append_shared_ms": 0.0,
@@ -1609,7 +1617,11 @@ class Qwen3_5ForCausalLM(nn.Module):
                 "DFLASH profile target_qwen35_moe: step=%d "
                 "forward_mode=%s start_layer=%d end_layer=%d "
                 "moe_layers=%d dual_stream_layers=%d fused_shared_layers=%d "
-                "shared_disabled_layers=%d gate_ms=%.3f topk_ms=%.3f "
+                "shared_disabled_layers=%d empty_layers=%d "
+                "input_tokens=%d hidden_elements=%d topk_assignments=%d "
+                "topk_width_sum=%d topk_width_layers=%d "
+                "standard_topk_layers=%d nonstandard_topk_layers=%d "
+                "gate_ms=%.3f topk_ms=%.3f "
                 "append_shared_ms=%.3f routed_experts_ms=%.3f "
                 "shared_expert_ms=%.3f add_shared_ms=%.3f "
                 "allreduce_ms=%.3f total_ms=%.3f",
@@ -1621,6 +1633,14 @@ class Qwen3_5ForCausalLM(nn.Module):
                 int(dflash_layer_profile["moe_dual_stream_layers"]),
                 int(dflash_layer_profile["moe_fused_shared_layers"]),
                 int(dflash_layer_profile["moe_shared_disabled_layers"]),
+                int(dflash_layer_profile["moe_empty_layers"]),
+                int(dflash_layer_profile["moe_input_tokens"]),
+                int(dflash_layer_profile["moe_hidden_elements"]),
+                int(dflash_layer_profile["moe_topk_assignments"]),
+                int(dflash_layer_profile["moe_topk_width_sum"]),
+                int(dflash_layer_profile["moe_topk_width_layers"]),
+                int(dflash_layer_profile["moe_standard_topk_layers"]),
+                int(dflash_layer_profile["moe_nonstandard_topk_layers"]),
                 float(dflash_layer_profile["moe_gate_ms"]),
                 float(dflash_layer_profile["moe_topk_ms"]),
                 float(dflash_layer_profile["moe_append_shared_ms"]),

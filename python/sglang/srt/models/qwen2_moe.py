@@ -180,6 +180,33 @@ def _qwen35_moe_dflash_profile_inc(profile, key: str) -> None:
         profile[key] = int(profile.get(key, 0)) + 1
 
 
+def _qwen35_moe_dflash_profile_add_int(profile, key: str, value: int) -> None:
+    if profile is not None:
+        profile[key] = int(profile.get(key, 0)) + int(value)
+
+
+def _qwen35_moe_dflash_profile_record_topk(profile, topk_output) -> None:
+    if profile is None:
+        return
+    topk_ids = getattr(topk_output, "topk_ids", None)
+    if topk_ids is None:
+        _qwen35_moe_dflash_profile_inc(profile, "moe_nonstandard_topk_layers")
+        return
+
+    _qwen35_moe_dflash_profile_inc(profile, "moe_standard_topk_layers")
+    _qwen35_moe_dflash_profile_add_int(
+        profile, "moe_topk_assignments", int(topk_ids.numel())
+    )
+    if topk_ids.dim() == 0:
+        topk_width = 0
+    elif topk_ids.dim() == 1:
+        topk_width = 1 if topk_ids.numel() else 0
+    else:
+        topk_width = int(topk_ids.shape[-1])
+    _qwen35_moe_dflash_profile_add_int(profile, "moe_topk_width_sum", topk_width)
+    _qwen35_moe_dflash_profile_add_int(profile, "moe_topk_width_layers", 1)
+
+
 def _should_use_unifyinfer_qwen35_hip_alt_stream_decode_only(
     forward_batch: Optional[ForwardBatch],
 ) -> bool:
@@ -575,6 +602,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     dflash_profile, dflash_profile_phase
                 ),
             )
+            _qwen35_moe_dflash_profile_record_topk(dflash_profile, topk_output)
             if use_fused_shared_expert and TopKOutputChecker.format_is_standard(
                 topk_output
             ):
@@ -632,6 +660,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             "moe_topk_ms",
             _qwen35_moe_dflash_profile_elapsed_ms(dflash_profile, dflash_profile_phase),
         )
+        _qwen35_moe_dflash_profile_record_topk(dflash_profile, topk_output)
         if self.enable_shared_expert_fusion and TopKOutputChecker.format_is_standard(
             topk_output
         ):
@@ -748,6 +777,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         _qwen35_moe_dflash_profile_inc(dflash_profile, "moe_layers")
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
+        _qwen35_moe_dflash_profile_add_int(
+            dflash_profile, "moe_input_tokens", int(num_tokens)
+        )
+        _qwen35_moe_dflash_profile_add_int(
+            dflash_profile, "moe_hidden_elements", int(num_tokens * hidden_dim)
+        )
+        if num_tokens == 0:
+            _qwen35_moe_dflash_profile_inc(dflash_profile, "moe_empty_layers")
         disable_shared_expert = _should_disable_unifyinfer_qwen35_shared_expert(
             forward_batch
         )
