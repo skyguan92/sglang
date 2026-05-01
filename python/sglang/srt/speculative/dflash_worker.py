@@ -1471,6 +1471,11 @@ class DFlashWorker:
             "UNIFYINFER_DFLASH_TRUE_PARTIAL_VERIFY_STATE_DIGESTS"
         )
 
+    def _true_partial_full_width_shape_control_enabled(self) -> bool:
+        return get_bool_env_var(
+            "UNIFYINFER_DFLASH_TRUE_PARTIAL_VERIFY_FULL_WIDTH_SHAPE_CONTROL"
+        )
+
     def _target_aux_hidden_capture_source(self) -> dict[str, Any]:
         model = getattr(self.target_worker.model_runner, "model", None)
         candidates = [
@@ -1733,20 +1738,28 @@ class DFlashWorker:
                 min=1,
                 max=full_width,
             )
-            partial_width = int(prefix_lens.max().item())
-            if partial_width >= full_width:
+            greedy_partial_width = int(prefix_lens.max().item())
+            if greedy_partial_width >= full_width:
                 # This row would be a full-width rerun, not a partial-forward proof.
                 return
+            full_width_shape_control = (
+                self._true_partial_full_width_shape_control_enabled()
+            )
+            proof_forward_width = (
+                full_width if full_width_shape_control else greedy_partial_width
+            )
 
             positions = verify_input.positions.view(bs, full_width)
             full_positions_cpu = positions.detach().to(device="cpu", dtype=torch.int64)
-            partial_positions_cpu = full_positions_cpu[:, :partial_width].contiguous()
+            partial_positions_cpu = full_positions_cpu[
+                :, :proof_forward_width
+            ].contiguous()
             partial_spec = DFlashVerifyInput(
-                draft_token=candidates[:, :partial_width].reshape(-1).contiguous(),
-                positions=positions[:, :partial_width].reshape(-1).contiguous(),
-                draft_token_num=partial_width,
+                draft_token=candidates[:, :proof_forward_width].reshape(-1).contiguous(),
+                positions=positions[:, :proof_forward_width].reshape(-1).contiguous(),
+                draft_token_num=proof_forward_width,
                 capture_hidden_mode=CaptureHiddenMode.FULL,
-                num_tokens_per_batch=partial_width,
+                num_tokens_per_batch=proof_forward_width,
             )
             _, build_custom_mask = resolve_dflash_verify_mask_policy(
                 self.model_runner.attn_backend
@@ -1754,7 +1767,7 @@ class DFlashWorker:
             if build_custom_mask:
                 partial_spec.custom_mask = self._build_true_partial_verify_mask(
                     batch=batch,
-                    partial_width=partial_width,
+                    partial_width=proof_forward_width,
                 )
 
             if self._true_partial_proof_request_forward_enabled():
@@ -1763,7 +1776,7 @@ class DFlashWorker:
                         batch=batch,
                         model_worker_batch=model_worker_batch,
                         partial_spec=partial_spec,
-                        partial_width=partial_width,
+                        partial_width=proof_forward_width,
                         forward_kwargs=forward_kwargs,
                         pre_verify_recurrent_seed=pre_verify_recurrent_seed,
                     )
@@ -1776,7 +1789,7 @@ class DFlashWorker:
                         batch=batch,
                         model_worker_batch=model_worker_batch,
                         partial_spec=partial_spec,
-                        partial_width=partial_width,
+                        partial_width=proof_forward_width,
                         forward_kwargs=forward_kwargs,
                     )
                 )
@@ -1791,7 +1804,7 @@ class DFlashWorker:
                 partial_worker_batch = replace(
                     model_worker_batch,
                     input_ids=partial_spec.draft_token,
-                    out_cache_loc=out_cache_loc[:, :partial_width]
+                    out_cache_loc=out_cache_loc[:, :proof_forward_width]
                     .reshape(-1)
                     .contiguous(),
                     spec_info=partial_spec,
@@ -1808,7 +1821,7 @@ class DFlashWorker:
                 return
             partial_target_predict = torch.argmax(
                 partial_logits.next_token_logits, dim=-1
-            ).view(bs, partial_width)
+            ).view(bs, proof_forward_width)
             full_boundary_digests = getattr(
                 logits_output,
                 "unifyinfer_qwen35_dflash_boundary_digests",
@@ -1829,7 +1842,7 @@ class DFlashWorker:
                 full_target_predict=full_target_predict,
                 full_hidden=hidden.view(bs, full_width, -1),
                 partial_target_predict=partial_target_predict,
-                partial_hidden=partial_hidden.view(bs, partial_width, -1),
+                partial_hidden=partial_hidden.view(bs, proof_forward_width, -1),
                 prefix_lens=prefix_lens.detach().cpu().tolist(),
                 profile_step=getattr(verify_input, "profile_step", None),
                 req_ids=[
@@ -1846,8 +1859,14 @@ class DFlashWorker:
                     "full_positions": full_positions_cpu.tolist(),
                     "partial_positions": partial_positions_cpu.tolist(),
                     "partial_positions_match_full_prefix": bool(
-                        torch.equal(full_positions_cpu[:, :partial_width], partial_positions_cpu)
+                        torch.equal(
+                            full_positions_cpu[:, :proof_forward_width],
+                            partial_positions_cpu,
+                        )
                     ),
+                    "greedy_partial_width": int(greedy_partial_width),
+                    "proof_forward_width": int(proof_forward_width),
+                    "full_width_shape_control": bool(full_width_shape_control),
                     "req_pool_indices": [
                         int(item) for item in batch.req_pool_indices.detach().cpu().tolist()
                     ],
@@ -2139,6 +2158,9 @@ class DFlashWorker:
             + "."
             + req_to_token_pool.__class__.__name__,
             has_mamba_mapping=has_mamba_mapping,
+            allow_full_width_shape_control=(
+                self._true_partial_full_width_shape_control_enabled()
+            ),
         )
         if not proof_plan["eligible"]:
             logger.warning(

@@ -435,6 +435,51 @@ def _qwen35_dflash_record_boundary_digest(
     )
 
 
+def _qwen35_dflash_record_native_layernorm_digest(
+    forward_batch: Optional[ForwardBatch],
+    *,
+    layer_id: int,
+    stage_prefix: str,
+    layernorm: torch.nn.Module,
+    hidden_states: Optional[torch.Tensor],
+    residual: Optional[torch.Tensor],
+) -> None:
+    if (
+        not _qwen35_dflash_boundary_digest_enabled(forward_batch)
+        or hidden_states is None
+        or not isinstance(hidden_states, torch.Tensor)
+        or not hasattr(layernorm, "forward_native")
+    ):
+        return
+    try:
+        with torch.no_grad():
+            hidden_clone = hidden_states.detach().clone()
+            residual_clone = (
+                residual.detach().clone()
+                if residual is not None and isinstance(residual, torch.Tensor)
+                else None
+            )
+            native = layernorm.forward_native(hidden_clone, residual_clone)
+        if isinstance(native, tuple):
+            native_hidden, native_residual = native
+        else:
+            native_hidden, native_residual = native, None
+        _qwen35_dflash_record_boundary_digest(
+            forward_batch,
+            layer_id=int(layer_id),
+            stage=f"{stage_prefix}_native_hidden",
+            tensor=native_hidden,
+        )
+        _qwen35_dflash_record_boundary_digest(
+            forward_batch,
+            layer_id=int(layer_id),
+            stage=f"{stage_prefix}_native_residual",
+            tensor=native_residual,
+        )
+    except Exception:
+        return
+
+
 def _qwen35_dflash_current_boundary_probe_layer(
     forward_batch: Optional[ForwardBatch], layer_id: int
 ) -> bool:
@@ -1075,6 +1120,16 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 tensor=residual,
             )
 
+        if dflash_boundary_probe_layer:
+            _qwen35_dflash_record_native_layernorm_digest(
+                forward_batch,
+                layer_id=int(self.layer_id),
+                stage_prefix="post_input_layernorm",
+                layernorm=self.input_layernorm,
+                hidden_states=hidden_states,
+                residual=residual,
+            )
+
         dflash_profile_phase = _qwen35_dflash_profile_start(dflash_profile_enabled)
         hidden_states, residual = (
             self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
@@ -1131,6 +1186,16 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 )
 
         # Fully Connected
+        if dflash_boundary_probe_layer:
+            _qwen35_dflash_record_native_layernorm_digest(
+                forward_batch,
+                layer_id=int(self.layer_id),
+                stage_prefix="post_attention_layernorm",
+                layernorm=self.post_attention_layernorm,
+                hidden_states=hidden_states,
+                residual=residual,
+            )
+
         dflash_profile_phase = _qwen35_dflash_profile_start(dflash_profile_enabled)
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
@@ -1514,6 +1579,16 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 tensor=residual,
             )
 
+        if dflash_boundary_probe_layer:
+            _qwen35_dflash_record_native_layernorm_digest(
+                forward_batch,
+                layer_id=int(self.layer_id),
+                stage_prefix="post_input_layernorm",
+                layernorm=self.input_layernorm,
+                hidden_states=hidden_states,
+                residual=residual,
+            )
+
         dflash_profile_phase = _qwen35_dflash_profile_start(dflash_profile_enabled)
         hidden_states, residual = (
             self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
@@ -1569,6 +1644,16 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 )
 
         # Fully Connected
+        if dflash_boundary_probe_layer:
+            _qwen35_dflash_record_native_layernorm_digest(
+                forward_batch,
+                layer_id=int(self.layer_id),
+                stage_prefix="post_attention_layernorm",
+                layernorm=self.post_attention_layernorm,
+                hidden_states=hidden_states,
+                residual=residual,
+            )
+
         dflash_profile_phase = _qwen35_dflash_profile_start(dflash_profile_enabled)
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
